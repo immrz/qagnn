@@ -1,1 +1,9 @@
 saved*
+data
+data_old
+*.zip
+**/__pycache__
+*.log.txt
+amlt
+.amltignore
+.amltconfig

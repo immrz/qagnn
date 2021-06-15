@@ -1,6 +1,7 @@
 import argparse
 from utils.utils import *
 from modeling.modeling_encoder import MODEL_NAME_TO_CLASS
+import os
 
 ENCODER_DEFAULT_LR = {
     'default': 1e-3,
@@ -30,11 +31,13 @@ DATASET_SETTING = {
 
 DATASET_NO_TEST = ['socialiqa']
 
+DATA_ROOT = os.environ.get('AMLT_DATA_DIR', 'data')
+
 EMB_PATHS = {
-    'transe': 'data/transe/glove.transe.sgd.ent.npy',
-    'lm': 'data/transe/glove.transe.sgd.ent.npy',
-    'numberbatch': 'data/transe/concept.nb.npy',
-    'tzw': 'data/cpnet/tzw.ent.npy',
+    'transe': f'{DATA_ROOT}/transe/glove.transe.sgd.ent.npy',
+    'lm': f'{DATA_ROOT}/transe/glove.transe.sgd.ent.npy',
+    'numberbatch': f'{DATA_ROOT}/transe/concept.nb.npy',
+    'tzw': f'{DATA_ROOT}/cpnet/tzw.ent.npy',
 }
 
 
@@ -44,18 +47,17 @@ def add_data_arguments(parser):
     # dataset specific
     parser.add_argument('-ds', '--dataset', default='csqa', choices=DATASET_LIST, help='dataset name')
     parser.add_argument('-ih', '--inhouse', type=bool_flag, nargs='?', const=True, help='run in-house setting')
-    parser.add_argument('--inhouse_train_qids', default='data/{dataset}/inhouse_split_qids.txt', help='qids of the in-house training set')
+    parser.add_argument('--inhouse_train_qids', default=None, help='qids of the in-house training set')
     # statements
-    parser.add_argument('--train_statements', default='data/{dataset}/statement/train.statement.jsonl')
-    parser.add_argument('--dev_statements', default='data/{dataset}/statement/dev.statement.jsonl')
-    parser.add_argument('--test_statements', default='data/{dataset}/statement/test.statement.jsonl')
+    parser.add_argument('--train_statements', default=None)
+    parser.add_argument('--dev_statements', default=None)
+    parser.add_argument('--test_statements', default=None)
     # preprocessing options
     parser.add_argument('-sl', '--max_seq_len', default=100, type=int)
     # set dataset defaults
     args, _ = parser.parse_known_args()
     parser.set_defaults(ent_emb_paths=[EMB_PATHS.get(s) for s in args.ent_emb],
-                        inhouse=(DATASET_SETTING[args.dataset] == 'inhouse'),
-                        inhouse_train_qids=args.inhouse_train_qids.format(dataset=args.dataset))
+                        inhouse=(DATASET_SETTING[args.dataset] == 'inhouse'))
     data_splits = ('train', 'dev') if args.dataset in DATASET_NO_TEST else ('train', 'dev', 'test')
     for split in data_splits:
         for attribute in ('statements',):
