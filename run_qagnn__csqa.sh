@@ -42,6 +42,5 @@ for seed in 0; do
       --test_statements  ${data_root}/${dataset}/statement/test.statement.jsonl \
       --inhouse_train_qids  ${data_root}/${dataset}/inhouse_split_qids.txt \
       --save_model \
-      --save_dir ${save_dir_pref}/${dataset}/enc-${model}__k${k}__gnndim${gnndim}__bs${bs}__seed${seed}__${dt} $args \
-  > train_${dataset}__enc-${model}__k${k}__gnndim${gnndim}__bs${bs}__seed${seed}__${dt}.log.txt
+      --save_dir ${save_dir_pref}/enc-${model}__k${k}__gnndim${gnndim}__bs${bs}__seed${seed}__${dt} $args
 done
