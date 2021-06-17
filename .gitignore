@@ -8,3 +8,4 @@ amlt
 .amltignore
 .amltconfig
 tox.ini
+notebooks
