@@ -79,7 +79,7 @@ class QAGNN_Message_Passing(nn.Module):
             node_score_emb = self.activation(self.emb_score(B))  # [batch_size, n_node, dim/2]
 
         X = H
-        edge_index, edge_type = A  # edge_index: [2, total_E]   edge_type: [total_E, ]  where total_E is for the batched graph
+        edge_index, edge_type = A  # edge_index: [2, total_E]   edge_type: [total_E, ] where total_E is for the batched graph
         _X = X.view(-1, X.size(2)).contiguous()  # [`total_n_nodes`, d_node] where `total_n_nodes` = b_size * n_node
         _node_type = node_type.view(-1).contiguous()  # [`total_n_nodes`, ]
         # [`total_n_nodes`, dim]
@@ -101,6 +101,13 @@ class QAGNN(nn.Module):
                  fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                  pretrained_concept_emb=None, freeze_ent_emb=True,
                  init_range=0.02):
+        """Perform joint reasoning on the QA context embedding and the subgraph.
+
+        concept_dim:
+            The GNN dimension.
+        concept_in_dim:
+            The pretrained node embedding dimension.
+        """
         super().__init__()
         self.init_range = init_range
 
@@ -148,10 +155,14 @@ class QAGNN(nn.Module):
 
         returns: (batch_size, 1)
         """
-        gnn_input0 = self.activation(self.svec2nvec(sent_vecs)).unsqueeze(1)  # (batch_size, 1, dim_node)
-        gnn_input1 = self.concept_emb(concept_ids[:, 1:] - 1, emb_data)  # (batch_size, n_node-1, dim_node)
+
+        # emb of the *pseudo* node, i.e., the QA context. (batch_size, 1, dim_node)
+        gnn_input0 = self.activation(self.svec2nvec(sent_vecs)).unsqueeze(1)
+        # emb of the KG nodes. (batch_size, n_node-1, dim_node)
+        gnn_input1 = self.concept_emb(concept_ids[:, 1:] - 1, emb_data)
         gnn_input1 = gnn_input1.to(node_type_ids.device)
-        gnn_input = self.dropout_e(torch.cat([gnn_input0, gnn_input1], dim=1))  # (batch_size, n_node, dim_node)
+        # concatenation followed by dropout. (batch_size, n_node, dim_node)
+        gnn_input = self.dropout_e(torch.cat([gnn_input0, gnn_input1], dim=1))
 
         # Normalize node sore (use norm from Z)
         # 0 means masked out # [batch_size, n_node]
@@ -164,6 +175,7 @@ class QAGNN(nn.Module):
         node_scores = node_scores / (mean_norm.unsqueeze(1) + 1e-05)  # [batch_size, n_node]
         node_scores = node_scores.unsqueeze(2)  # [batch_size, n_node, 1]
 
+        # run message passing
         gnn_output = self.gnn(gnn_input, adj, node_type_ids, node_scores)
 
         Z_vecs = gnn_output[:, 0]  # (batch_size, dim_node)
@@ -204,16 +216,23 @@ class LM_QAGNN(nn.Module):
     def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
         """
         sent_vecs: (batch_size, num_choice, d_sent)    -> (batch_size * num_choice, d_sent)
+        token_type_ids and attention_mask, etc.
+
         concept_ids: (batch_size, num_choice, n_node)  -> (batch_size * num_choice, n_node)
         node_type_ids: (batch_size, num_choice, n_node) -> (batch_size * num_choice, n_node)
+        node_scores
+
         adj_lengths: (batch_size, num_choice)          -> (batch_size * num_choice, )
-        adj -> edge_index, edge_type
-            edge_index: list of (batch_size, num_choice) -> list of (batch_size * num_choice, ); each entry is torch.tensor(2, E(variable))
-                                                         -> (2, total E)
-            edge_type:  list of (batch_size, num_choice) -> list of (batch_size * num_choice, ); each entry is torch.tensor(E(variable), )
-                                                         -> (total E, )
-        returns: (batch_size, 1)
+        adj = (edge_index, edge_type)
+            edge_index: list shaped (batch_size, num_choice)
+                -> list shaped (batch_size * num_choice,); each entry is torch.tensor(2, E(variable))
+                -> (2, total E)
+            edge_type: list shaped (batch_size, num_choice)
+                -> list shaped (batch_size * num_choice,); each entry is torch.tensor(E(variable), )
+                -> (total E,)
+        returns: (batch_size, num_choice)
         """
+        # bs: mini_batch_size, nc: number of answer choices
         bs, nc = inputs[0].size(0), inputs[0].size(1)
 
         # Here, merge the batch dimension and the num_choice dimension
@@ -222,11 +241,14 @@ class LM_QAGNN(nn.Module):
         # flatten the torch tensors and lists along the first two dim
         _inputs = [x.view(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[:-2]] + [sum(x, []) for x in inputs[-2:]]
 
+        # here lm_inputs contains all the embeddings needed by the LM
         *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type = _inputs
-        edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
+
         # edge_index: [2, total_E]   edge_type: [total_E, ]
+        edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
         adj = (edge_index.to(node_type_ids.device), edge_type.to(node_type_ids.device))
 
+        # sent_vecs shape: (mini_batch_size*num_choice, d_LM)
         sent_vecs, all_hidden_states = self.encoder(*lm_inputs, layer_id=layer_id)
         logits, attn = self.decoder(sent_vecs.to(node_type_ids.device),
                                     concept_ids,
@@ -241,8 +263,8 @@ class LM_QAGNN(nn.Module):
             # edge_type_orig: list of (batch_size, num_choice). each entry is torch.tensor(E, )
 
     def batch_graph(self, edge_index_init, edge_type_init, n_nodes):
-        # edge_index_init: list of (n_examples, ). each entry is torch.tensor(2, E)
-        # edge_type_init:  list of (n_examples, ). each entry is torch.tensor(E, )
+        # edge_index_init: list shaped (n_examples,). each entry is torch.tensor(2, E)
+        # edge_type_init:  list shaped (n_examples,). each entry is torch.tensor(E, )
         n_examples = len(edge_index_init)
         edge_index = [edge_index_init[_i_] + _i_ * n_nodes for _i_ in range(n_examples)]
         edge_index = torch.cat(edge_index, dim=1)  # [2, total_E]
@@ -266,22 +288,33 @@ class LM_QAGNN_DataLoader(object):
 
         model_type = MODEL_NAME_TO_CLASS[model_name]
         print('train_statement_path', train_statement_path)
-        self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(train_statement_path, model_type, model_name, max_seq_length)
-        self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(dev_statement_path, model_type, model_name, max_seq_length)
+
+        # the LM features, e.g., token_ids, attention_mask, etc.
+        self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(
+            train_statement_path, model_type, model_name, max_seq_length)
+        self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(
+            dev_statement_path, model_type, model_name, max_seq_length)
 
         num_choice = self.train_encoder_data[0].size(1)
         self.num_choice = num_choice
         print('num_choice', num_choice)
-        *self.train_decoder_data, self.train_adj_data = load_sparse_adj_data_with_contextnode(train_adj_path, max_node_num, num_choice, args)
+        *self.train_decoder_data, self.train_adj_data = load_sparse_adj_data_with_contextnode(
+            train_adj_path, max_node_num, num_choice, args)
 
-        *self.dev_decoder_data, self.dev_adj_data = load_sparse_adj_data_with_contextnode(dev_adj_path, max_node_num, num_choice, args)
-        assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0) for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
-        assert all(len(self.dev_qids) == len(self.dev_adj_data[0]) == x.size(0) for x in [self.dev_labels] + self.dev_encoder_data + self.dev_decoder_data)
+        *self.dev_decoder_data, self.dev_adj_data = load_sparse_adj_data_with_contextnode(
+            dev_adj_path, max_node_num, num_choice, args)
+        assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0)
+                   for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
+        assert all(len(self.dev_qids) == len(self.dev_adj_data[0]) == x.size(0)
+                   for x in [self.dev_labels] + self.dev_encoder_data + self.dev_decoder_data)
 
         if test_statement_path is not None:
-            self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(test_statement_path, model_type, model_name, max_seq_length)
-            *self.test_decoder_data, self.test_adj_data = load_sparse_adj_data_with_contextnode(test_adj_path, max_node_num, num_choice, args)
-            assert all(len(self.test_qids) == len(self.test_adj_data[0]) == x.size(0) for x in [self.test_labels] + self.test_encoder_data + self.test_decoder_data)
+            self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(
+                test_statement_path, model_type, model_name, max_seq_length)
+            *self.test_decoder_data, self.test_adj_data = load_sparse_adj_data_with_contextnode(
+                test_adj_path, max_node_num, num_choice, args)
+            assert all(len(self.test_qids) == len(self.test_adj_data[0]) == x.size(0)
+                       for x in [self.test_labels] + self.test_encoder_data + self.test_decoder_data)
 
         if self.is_inhouse:
             with open(inhouse_train_qids_path, 'r') as fin:
@@ -301,7 +334,8 @@ class LM_QAGNN_DataLoader(object):
                 self.train_encoder_data = [x[:n_train] for x in self.train_encoder_data]
                 self.train_decoder_data = [x[:n_train] for x in self.train_decoder_data]
                 self.train_adj_data = self.train_adj_data[:n_train]
-                assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0) for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
+                assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0)
+                           for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
             assert self.train_size() == n_train
 
     def train_size(self):
@@ -322,19 +356,33 @@ class LM_QAGNN_DataLoader(object):
             train_indexes = self.inhouse_train_indexes[torch.randperm(n_train)]
         else:
             train_indexes = torch.randperm(len(self.train_qids))
-        return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.batch_size, train_indexes, self.train_qids, self.train_labels, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data)
+        return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.batch_size, train_indexes,
+                                                   self.train_qids, self.train_labels, tensors0=self.train_encoder_data,
+                                                   tensors1=self.train_decoder_data, adj_data=self.train_adj_data)
 
     def train_eval(self):
-        return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size, torch.arange(len(self.train_qids)), self.train_qids, self.train_labels, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data)
+        return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size,
+                                                   torch.arange(len(self.train_qids)), self.train_qids,
+                                                   self.train_labels, tensors0=self.train_encoder_data,
+                                                   tensors1=self.train_decoder_data, adj_data=self.train_adj_data)
 
     def dev(self):
-        return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size, torch.arange(len(self.dev_qids)), self.dev_qids, self.dev_labels, tensors0=self.dev_encoder_data, tensors1=self.dev_decoder_data, adj_data=self.dev_adj_data)
+        return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size,
+                                                   torch.arange(len(self.dev_qids)), self.dev_qids,
+                                                   self.dev_labels, tensors0=self.dev_encoder_data,
+                                                   tensors1=self.dev_decoder_data, adj_data=self.dev_adj_data)
 
     def test(self):
         if self.is_inhouse:
-            return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size, self.inhouse_test_indexes, self.train_qids, self.train_labels, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data)
+            return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size,
+                                                       self.inhouse_test_indexes, self.train_qids,
+                                                       self.train_labels, tensors0=self.train_encoder_data,
+                                                       tensors1=self.train_decoder_data, adj_data=self.train_adj_data)
         else:
-            return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size, torch.arange(len(self.test_qids)), self.test_qids, self.test_labels, tensors0=self.test_encoder_data, tensors1=self.test_decoder_data, adj_data=self.test_adj_data)
+            return MultiGPUSparseAdjDataBatchGenerator(self.device0, self.device1, self.eval_batch_size,
+                                                       torch.arange(len(self.test_qids)), self.test_qids,
+                                                       self.test_labels, tensors0=self.test_encoder_data,
+                                                       tensors1=self.test_decoder_data, adj_data=self.test_adj_data)
 
 
 ###############################################################################
@@ -363,7 +411,6 @@ def make_one_hot(labels, C):
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree, softmax
 from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool, GlobalAttention, Set2Set
-import torch.nn.functional as F
 from torch_scatter import scatter_add, scatter
 from torch_geometric.nn.inits import glorot, zeros
 

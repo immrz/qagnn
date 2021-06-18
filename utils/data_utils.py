@@ -76,23 +76,26 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
         with open(adj_pk_path, 'rb') as fin:
             adj_concept_pairs = pickle.load(fin)
 
-        n_samples = len(adj_concept_pairs) #this is actually n_questions x n_choices
+        n_samples = len(adj_concept_pairs)  # len = n_questions * n_choices
         edge_index, edge_type = [], []
         adj_lengths = torch.zeros((n_samples,), dtype=torch.long)
+        # max_node_num is 200 by default
         concept_ids = torch.full((n_samples, max_node_num), 1, dtype=torch.long)
-        node_type_ids = torch.full((n_samples, max_node_num), 2, dtype=torch.long) #default 2: "other node"
+        node_type_ids = torch.full((n_samples, max_node_num), 2, dtype=torch.long)  # default 2: "other node"
         node_scores = torch.zeros((n_samples, max_node_num, 1), dtype=torch.float)
 
         adj_lengths_ori = adj_lengths.clone()
         for idx, _data in tqdm(enumerate(adj_concept_pairs), total=n_samples, desc='loading adj matrices'):
             adj, concepts, qm, am, cid2score = _data['adj'], _data['concepts'], _data['qmask'], _data['amask'], _data['cid2score']
-            #adj: e.g. <4233x249 (n_nodes*half_n_rels x n_nodes) sparse matrix of type '<class 'numpy.bool'>' with 2905 stored elements in COOrdinate format>
-            #concepts: np.array(num_nodes, ), where entry is concept id
-            #qm: np.array(num_nodes, ), where entry is True/False
-            #am: np.array(num_nodes, ), where entry is True/False
+            # adj: (n_nodes*17, n_nodes) where 17 is the number of relation types; sparse matrix in COOrdinate format
+            # concepts: np.array(n_nodes,), where entry is concept id
+            # NOTE: concepts always start with question entities, then answer entities, then other entities.
+            # qm: np.array(n_nodes,), where entry is True/False
+            # am: np.array(n_nodes,), where entry is True/False
             assert len(concepts) == len(set(concepts))
             qam = qm | am
-            #sanity check: should be T,..,T,F,F,..F
+
+            # sanity check: should be T,..,T,F,F,..F
             assert qam[0] == True
             F_start = False
             for TF in qam:
@@ -100,55 +103,62 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
                     F_start = True
                 else:
                     assert F_start == False
-            num_concept = min(len(concepts), max_node_num-1) + 1 #this is the final number of nodes including contextnode but excluding PAD
+
+            # this is the final number of nodes including contextnode but excluding PAD
+            num_concept = min(len(concepts), max_node_num - 1) + 1
             adj_lengths_ori[idx] = len(concepts)
             adj_lengths[idx] = num_concept
 
-            #Prepare nodes
-            concepts = concepts[:num_concept-1]
-            concept_ids[idx, 1:num_concept] = torch.tensor(concepts +1)  #To accomodate contextnode, original concept_ids incremented by 1
-            concept_ids[idx, 0] = 0 #this is the "concept_id" for contextnode
+            # Prepare nodes. NOTE: length of concepts is num_concept - 1
+            concepts = concepts[:num_concept - 1]
+            # NOTE: to accomodate contextnode, original concept_ids incremented by 1
+            concept_ids[idx, 1:num_concept] = torch.tensor(concepts + 1)
+            concept_ids[idx, 0] = 0  # this is the "concept_id" for contextnode
 
-            #Prepare node scores
+            # Prepare node scores
             if (cid2score is not None):
                 for _j_ in range(num_concept):
                     _cid = int(concept_ids[idx, _j_]) - 1
                     assert _cid in cid2score
                 node_scores[idx, _j_, 0] = torch.tensor(cid2score[_cid])
 
-            #Prepare node types
-            node_type_ids[idx, 0] = 3 #contextnode
+            # Prepare node types
+            node_type_ids[idx, 0] = 3  # contextnode
             node_type_ids[idx, 1:num_concept][torch.tensor(qm, dtype=torch.bool)[:num_concept-1]] = 0
             node_type_ids[idx, 1:num_concept][torch.tensor(am, dtype=torch.bool)[:num_concept-1]] = 1
 
-            #Load adj
-            ij = torch.tensor(adj.row, dtype=torch.int64) #(num_matrix_entries, ), where each entry is coordinate
-            k = torch.tensor(adj.col, dtype=torch.int64)  #(num_matrix_entries, ), where each entry is coordinate
+            # Load adj
+            ij = torch.tensor(adj.row, dtype=torch.int64)  # (num_matrix_entries, ), where each entry is coordinate
+            k = torch.tensor(adj.col, dtype=torch.int64)   # (num_matrix_entries, ), where each entry is coordinate
             n_node = adj.shape[1]
             half_n_rel = adj.shape[0] // n_node
+            # i: relation type, j: entity position. (j, k, i) is the (e1, e2, r) triplet.
+            # NOTE: j and k are index, not concept ids.
             i, j = ij // n_node, ij % n_node
 
-            #Prepare edges
+            # Prepare edges
             i += 2; j += 1; k += 1  # **** increment coordinate by 1, rel_id by 2 ****
             extra_i, extra_j, extra_k = [], [], []
+
+            # add an edge between contextnode and each question/answer concept.
             for _coord, q_tf in enumerate(qm):
                 _new_coord = _coord + 1
-                if _new_coord > num_concept:
+                if _new_coord > num_concept:  # should be >= here I think
                     break
                 if q_tf:
-                    extra_i.append(0) #rel from contextnode to question concept
-                    extra_j.append(0) #contextnode coordinate
-                    extra_k.append(_new_coord) #question concept coordinate
+                    extra_i.append(0)  # rel from contextnode to question concept
+                    extra_j.append(0)  # contextnode coordinate
+                    extra_k.append(_new_coord)  # question concept coordinate
             for _coord, a_tf in enumerate(am):
                 _new_coord = _coord + 1
                 if _new_coord > num_concept:
                     break
                 if a_tf:
-                    extra_i.append(1) #rel from contextnode to answer concept
-                    extra_j.append(0) #contextnode coordinate
-                    extra_k.append(_new_coord) #answer concept coordinate
+                    extra_i.append(1)  # rel from contextnode to answer concept
+                    extra_j.append(0)  # contextnode coordinate
+                    extra_k.append(_new_coord)  # answer concept coordinate
 
-            half_n_rel += 2 #should be 19 now
+            half_n_rel += 2  # should be 19 now
             if len(extra_i) > 0:
                 i = torch.cat([i, torch.tensor(extra_i)], dim=0)
                 j = torch.cat([j, torch.tensor(extra_j)], dim=0)
@@ -158,32 +168,31 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
             mask = (j < max_node_num) & (k < max_node_num)
             i, j, k = i[mask], j[mask], k[mask]
             i, j, k = torch.cat((i, i + half_n_rel), 0), torch.cat((j, k), 0), torch.cat((k, j), 0)  # add inverse relations
-            edge_index.append(torch.stack([j,k], dim=0)) #each entry is [2, E]
-            edge_type.append(i) #each entry is [E, ]
+            edge_index.append(torch.stack([j, k], dim=0))  # each entry is [2, E]
+            edge_type.append(i)  # each entry is [E, ]
 
         with open(cache_path, 'wb') as f:
             pickle.dump([adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel], f)
 
-
-    ori_adj_mean  = adj_lengths_ori.float().mean().item()
+    ori_adj_mean = adj_lengths_ori.float().mean().item()
     ori_adj_sigma = np.sqrt(((adj_lengths_ori.float() - ori_adj_mean)**2).mean().item())
     print('| ori_adj_len: mu {:.2f} sigma {:.2f} | adj_len: {:.2f} |'.format(ori_adj_mean, ori_adj_sigma, adj_lengths.float().mean().item()) +
           ' prune_rate： {:.2f} |'.format((adj_lengths_ori > adj_lengths).float().mean().item()) +
           ' qc_num: {:.2f} | ac_num: {:.2f} |'.format((node_type_ids == 0).float().sum(1).mean().item(),
                                                       (node_type_ids == 1).float().sum(1).mean().item()))
 
-    edge_index = list(map(list, zip(*(iter(edge_index),) * num_choice))) #list of size (n_questions, n_choices), where each entry is tensor[2, E] #this operation corresponds to .view(n_questions, n_choices)
-    edge_type = list(map(list, zip(*(iter(edge_type),) * num_choice))) #list of size (n_questions, n_choices), where each entry is tensor[E, ]
+    # list of size (n_questions, n_choices), where each entry is tensor[2, E]
+    # this operation corresponds to .view(n_questions, n_choices)
+    edge_index = list(map(list, zip(*(iter(edge_index),) * num_choice)))
+    # list of size (n_questions, n_choices), where each entry is tensor[E, ]
+    edge_type = list(map(list, zip(*(iter(edge_type),) * num_choice)))
 
     concept_ids, node_type_ids, node_scores, adj_lengths = [x.view(-1, num_choice, *x.size()[1:]) for x in (concept_ids, node_type_ids, node_scores, adj_lengths)]
-    #concept_ids: (n_questions, num_choice, max_node_num)
-    #node_type_ids: (n_questions, num_choice, max_node_num)
-    #node_scores: (n_questions, num_choice, max_node_num)
-    #adj_lengths: (n_questions,　num_choice)
-    return concept_ids, node_type_ids, node_scores, adj_lengths, (edge_index, edge_type) #, half_n_rel * 2 + 1
-
-
-
+    # concept_ids: (n_questions, num_choice, max_node_num)
+    # node_type_ids: (n_questions, num_choice, max_node_num)
+    # node_scores: (n_questions, num_choice, max_node_num)
+    # adj_lengths: (n_questions,　num_choice)
+    return concept_ids, node_type_ids, node_scores, adj_lengths, (edge_index, edge_type)  # , half_n_rel * 2 + 1
 
 
 def load_gpt_input_tensors(statement_jsonl_path, max_seq_length):

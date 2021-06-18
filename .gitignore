@@ -9,3 +9,4 @@ amlt
 .amltconfig
 tox.ini
 notebooks
+*.gz
