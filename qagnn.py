@@ -7,9 +7,13 @@ try:
 except:
     from transformers import get_constant_schedule, get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 
-from modeling.modeling_qagnn import *
+from modeling.modeling_qagnn import LM_QAGNN, LM_QAGNN_DataLoader
+from modeling.lm_as_edge_encoder import LM_QAGNN_LAEE
+
 from utils.optimization_utils import OPTIMIZER_CLASSES
-from utils.parser_utils import *
+from utils.parser_utils import get_parser
+from utils.utils import bool_flag, check_path, export_config, freeze_net, unfreeze_net, pretty_args
+from utils.data_utils import load_statement_dict
 
 
 DECODER_DEFAULT_LR = {
@@ -17,9 +21,10 @@ DECODER_DEFAULT_LR = {
     'obqa': 3e-4,
 }
 
-from collections import defaultdict, OrderedDict
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 import socket, os, subprocess, datetime
@@ -44,17 +49,19 @@ def main():
     parser = get_parser()
     args, _ = parser.parse_known_args()
     parser.add_argument('--mode', default='train', choices=['train', 'eval_detail'], help='run training or evaluation')
-    parser.add_argument('--save_dir', default=f'./saved_models/qagnn/', help='model output directory')
-    parser.add_argument('--save_model', dest='save_model', action='store_true')
+    parser.add_argument('--save_dir', default='./saved_models/qagnn/', help='model output directory')
+    parser.add_argument('--save_model', dest='save_model', action='store_true', help='whether to save model')
+    parser.add_argument('--save_best_model_only', action='store_true',
+                        help='only save best dev acc model instead of each epoch')
     parser.add_argument('--load_model_path', default=None)
-
 
     # data
     parser.add_argument('--num_relation', default=38, type=int, help='number of relations')
     parser.add_argument('--train_adj', default=f'data/{args.dataset}/graph/train.graph.adj.pk')
     parser.add_argument('--dev_adj', default=f'data/{args.dataset}/graph/dev.graph.adj.pk')
     parser.add_argument('--test_adj', default=f'data/{args.dataset}/graph/test.graph.adj.pk')
-    parser.add_argument('--use_cache', default=True, type=bool_flag, nargs='?', const=True, help='use cached data to accelerate data loading')
+    parser.add_argument('--use_cache', default=True, type=bool_flag, nargs='?',
+                        const=True, help='use cached data to accelerate data loading')
 
     # model architecture
     parser.add_argument('-k', '--k', default=5, type=int, help='perform k-layer message passing')
@@ -62,13 +69,14 @@ def main():
     parser.add_argument('--gnn_dim', default=100, type=int, help='dimension of the GNN layers')
     parser.add_argument('--fc_dim', default=200, type=int, help='number of FC hidden units')
     parser.add_argument('--fc_layer_num', default=0, type=int, help='number of FC layers')
-    parser.add_argument('--freeze_ent_emb', default=True, type=bool_flag, nargs='?', const=True, help='freeze entity embedding layer')
+    parser.add_argument('--freeze_ent_emb', default=True, type=bool_flag, nargs='?',
+                        const=True, help='freeze entity embedding layer')
+    parser.add_argument('--lm_as_edge_encoder', action='store_true')
 
     parser.add_argument('--max_node_num', default=200, type=int)
     parser.add_argument('--simple', default=False, type=bool_flag, nargs='?', const=True)
     parser.add_argument('--subsample', default=1.0, type=float)
     parser.add_argument('--init_range', default=0.02, type=float, help='stddev when initializing with normal distribution')
-
 
     # regularization
     parser.add_argument('--dropouti', type=float, default=0.2, help='dropout for embedding layer')
@@ -98,7 +106,7 @@ def main():
 
 
 def train(args):
-    print(args)
+    print(pretty_args(args))
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -146,16 +154,30 @@ def train(args):
     #   Build model                                                                                   #
     ###################################################################################################
 
-    model = LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
-                     concept_dim=args.gnn_dim,
-                     concept_in_dim=concept_dim,
-                     n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
-                     p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
-                     pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
-                     init_range=args.init_range,
-                     encoder_config={})
-    model.encoder.to(device0)
-    model.decoder.to(device1)
+    if args.lm_as_edge_encoder:
+        model = LM_QAGNN_LAEE(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
+                              concept_dim=args.gnn_dim,
+                              concept_in_dim=concept_dim,
+                              n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
+                              p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
+                              pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
+                              init_range=args.init_range,
+                              encoder_config={})
+        model.encoder.to(device0)
+        model.decoder.to(device1)
+        model.edge_encoder.to(device1)
+
+    else:
+        model = LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
+                         concept_dim=args.gnn_dim,
+                         concept_in_dim=concept_dim,
+                         n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
+                         p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
+                         pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
+                         init_range=args.init_range,
+                         encoder_config={})
+        model.encoder.to(device0)
+        model.decoder.to(device1)
 
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -279,27 +301,34 @@ def train(args):
         print('-' * 71)
         with open(log_path, 'a') as fout:
             fout.write('{},{},{}\n'.format(global_step, dev_acc, test_acc))
+
         if dev_acc >= best_dev_acc:
             best_dev_acc = dev_acc
             final_test_acc = test_acc
             best_dev_epoch = epoch_id
+
+            # save best dev acc model here
             if args.save_model:
-                torch.save([model, args], model_path +".{}".format(epoch_id))
-                with open(model_path +".{}.log.txt".format(epoch_id), 'w') as f:
+                torch.save([model, args], model_path)
+                with open(model_path + ".log.txt", 'w') as f:
                     for p in model.named_parameters():
-                        print (p, file=f)
-                print(f'model saved to {model_path}')
-        else:
-            if args.save_model:
-                torch.save([model, args], model_path +".{}".format(epoch_id))
-                with open(model_path +".{}.log.txt".format(epoch_id), 'w') as f:
-                    for p in model.named_parameters():
-                        print (p, file=f)
-                print(f'model saved to {model_path}')
+                        print(p, file=f)
+                print(f'Best model saved to {model_path} at epoch {epoch_id}')
+
+        # save model per epoch
+        if args.save_model and (not args.save_best_model_only):
+            torch.save([model, args], model_path + ".{}".format(epoch_id))
+            with open(model_path + ".{}.log.txt".format(epoch_id), 'w') as f:
+                for p in model.named_parameters():
+                    print(p, file=f)
+            print(f'Epoch model saved to {model_path}')
+
         model.train()
         start_time = time.time()
         if epoch_id > args.unfreeze_epoch and epoch_id - best_dev_epoch >= args.max_epochs_before_stop:
             break
+
+    print(f'Final test accuracy is {final_test_acc}')
     # except (KeyboardInterrupt, RuntimeError) as e:
     #     print(e)
 

@@ -44,3 +44,13 @@ def test_data_loader_ms_per_batch(data_loader, max_steps=10000):
     start = time.time()
     n_batch = sum(1 for batch, _ in zip(data_loader, range(max_steps)))
     return (time.time() - start) * 1000 / n_batch
+
+
+def pretty_args(args):
+    """
+    Return a nice string repr of the argparse.Namespace object.
+    """
+    s = 'Args:\n'
+    for name, val in vars(args).items():
+        s += f'{name.replace("_", " ").capitalize()}: {val}\n'
+    return s + '\n'

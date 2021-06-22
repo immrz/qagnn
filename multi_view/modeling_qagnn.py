@@ -5,11 +5,6 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from transformers import BertModel, BertTokenizerFast
-from utils.conceptnet import relation_text
-import os
-import numpy as np
-
 
 class QAGNN_Message_Passing(nn.Module):
     def __init__(self, args, k, n_ntype, n_etype, input_size, hidden_size, output_size,
@@ -48,14 +43,14 @@ class QAGNN_Message_Passing(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.dropout_rate = dropout
 
-    def mp_helper(self, _X, edge_index, edge_type, _node_type, _node_feature_extra, edge_emb):
+    def mp_helper(self, _X, edge_index, edge_type, _node_type, _node_feature_extra):
         for _ in range(self.k):
-            _X = self.gnn_layers[_](_X, edge_index, edge_type, _node_type, _node_feature_extra, edge_emb)
+            _X = self.gnn_layers[_](_X, edge_index, edge_type, _node_type, _node_feature_extra)
             _X = self.activation(_X)
             _X = F.dropout(_X, self.dropout_rate, training=self.training)
         return _X
 
-    def forward(self, H, A, node_type, node_score, edge_emb, cache_output=False):
+    def forward(self, H, A, node_type, node_score, cache_output=False):
         """
         H: tensor of shape (batch_size, n_node, d_node)
             node features from the previous layer
@@ -90,7 +85,7 @@ class QAGNN_Message_Passing(nn.Module):
         # [`total_n_nodes`, dim]
         _node_feature_extra = torch.cat([node_type_emb, node_score_emb], dim=2).view(_node_type.size(0), -1).contiguous()
 
-        _X = self.mp_helper(_X, edge_index, edge_type, _node_type, _node_feature_extra, edge_emb)
+        _X = self.mp_helper(_X, edge_index, edge_type, _node_type, _node_feature_extra)
 
         X = _X.view(node_type.size(0), node_type.size(1), -1)  # [batch_size, n_node, dim]
 
@@ -148,7 +143,7 @@ class QAGNN(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, sent_vecs, concept_ids, node_type_ids, node_scores, adj_lengths, adj, emb_data=None, cache_output=False, edge_emb=None):
+    def forward(self, sent_vecs, concept_ids, node_type_ids, node_scores, adj_lengths, adj, emb_data=None, cache_output=False):
         """
         sent_vecs: (batch_size, dim_sent)
         concept_ids: (batch_size, n_node)
@@ -181,7 +176,7 @@ class QAGNN(nn.Module):
         node_scores = node_scores.unsqueeze(2)  # [batch_size, n_node, 1]
 
         # run message passing
-        gnn_output = self.gnn(gnn_input, adj, node_type_ids, node_scores, edge_emb)
+        gnn_output = self.gnn(gnn_input, adj, node_type_ids, node_scores)
 
         Z_vecs = gnn_output[:, 0]  # (batch_size, dim_node)
 
@@ -204,128 +199,7 @@ class QAGNN(nn.Module):
         return logits, pool_attn
 
 
-class LMEdgeEncoder(nn.Module):
-    def __init__(self, emb_size, concept_root=None):
-        super().__init__()
-
-        self.emb_size = emb_size
-        self.tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
-        self.batch_size = 4096
-        self.lm = BertModel.from_pretrained('bert-base-uncased')
-        self.lm.eval()
-
-        # linear transformation to match embedding size
-        self.ff = nn.Linear(self.lm.config.hidden_size, self.emb_size)
-
-        # read concept vocab and prepend token for context node
-        self.id2concept = ['[CONTEXT]']
-        if concept_root is None:
-            concept_root = os.environ.get('AMLT_DATA_DIR', 'data')
-        with open(os.path.join(concept_root, 'cpnet', 'concept.txt'), 'r', encoding='utf8') as fi:
-            self.id2concept.extend([w.strip().replace('_', ' ') for w in fi])
-
-        # complement the relation texts; totally 38 relations
-        self.relation_text = ['[CONTEXT_Q]', '[CONTEXT_A]'] + relation_text
-        self.relation_text.extend(['[Q_CONTEXT]', '[A_CONTEXT]',
-                                   'is the antonym of',
-                                   'locates',
-                                   'is a capability of',
-                                   'is caused by',
-                                   'creates',
-                                   'is',
-                                   'is desired by',
-                                   'is a subevent of',
-                                   'has component',
-                                   'has context',
-                                   'is a property of',
-                                   'composes',
-                                   'is not a capability of',
-                                   'is not desired by',
-                                   'is action on',
-                                   'is related to',
-                                   'requires'])
-
-        # use ndarray to acclerate
-        self.id2concept = np.array(self.id2concept)
-        self.relation_text = np.array(self.relation_text)
-
-        # update LM vocab with special tokens
-        self.tokenizer.add_special_tokens({'additional_special_tokens': [
-            '[CONTEXT]', '[CONTEXT_Q]', '[CONTEXT_A]', '[Q_CONTEXT]', '[A_CONTEXT]'
-        ]})
-
-        # NOTE: resize the LM
-        self.lm.resize_token_embeddings(len(self.tokenizer))
-
-    def build_edge_text(self, concept_ids, edge_index, edge_type):
-        """
-        Transform each triplet (e1, r, e2) into its text format.
-
-        Parameters:
-        -----------
-        concept_ids: torch.Tensor
-            The ids of the KG concepts in current subgraph. Shape (batch_size, max_node_num).
-        edge_index: torch.Tensor
-            The index of the head and tail concepts per edge in current subgraph.
-            The batches are concatenated along the dim=1, and the indices have been
-            shifted (see LM_QAGNN.batch_graph). Shape (2, E).
-        edge_type: torch.Tensor
-            The ids of the types of the edges in current subgraph. Shape (E,).
-
-        Returns:
-        --------
-        trip_txt: list of str
-            Text representation for each triplet in the subgraph. Length is E.
-        """
-        N = concept_ids.size(1)
-        assert (edge_index[0] // N).max().item() == concept_ids.size(0) - 1
-
-        # get head and tail ids. Shape (2, E)
-        headtail_ids = concept_ids[edge_index // N, edge_index % N]
-
-        # move to ndarray
-        headtail_ids, edge_type = headtail_ids.cpu().numpy(), edge_type.cpu().numpy()
-
-        # build text
-        headtail_txt = self.id2concept[headtail_ids]  # (2, E) array of str
-        edge_txt = self.relation_text[edge_type]  # (E,) array of str
-        trip_txt = [' '.join([h, r, t]) for h, r, t in zip(headtail_txt[0], edge_txt, headtail_txt[1])]
-
-        return trip_txt
-
-    def tokenize_and_encode(self, trip_txt, device):
-        """
-        Tokenize the triplet texts into LM inputs using the tokenizer. Then encode them with the LM.
-        Set `batch_size` smaller for GPU memory efficiency.
-        """
-        E = len(trip_txt)
-        embs = []
-        self.lm.eval()  # LM in eval mode
-
-        for start in range(0, E, self.batch_size):
-            end = min(start + self.batch_size, E)
-            to_tokenize = trip_txt[start:end]
-            tokenized = self.tokenizer(to_tokenize,
-                                       padding='max_length',
-                                       truncation=True,
-                                       max_length=32,
-                                       return_tensors='pt')
-
-            # freeze LM and encode
-            with torch.no_grad():
-                output = self.lm(**{k: v.to(device) for k, v in tokenized.items()}).pooler_output
-
-            # go into a linear transformation
-            emb = self.ff(output)
-            embs.append(emb)
-
-        embs = torch.cat(embs, dim=0)
-        assert embs.size(0) == E
-
-        return embs
-
-
-class LM_QAGNN_LAEE(nn.Module):
+class LM_QAGNN(nn.Module):
     def __init__(self, args, model_name, k, n_ntype, n_etype,
                  n_concept, concept_dim, concept_in_dim, n_attention_head,
                  fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
@@ -338,7 +212,6 @@ class LM_QAGNN_LAEE(nn.Module):
                              fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                              pretrained_concept_emb=pretrained_concept_emb, freeze_ent_emb=freeze_ent_emb,
                              init_range=init_range)
-        self.edge_encoder = LMEdgeEncoder(concept_dim)
 
     def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
         """
@@ -375,17 +248,12 @@ class LM_QAGNN_LAEE(nn.Module):
         edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
         adj = (edge_index.to(node_type_ids.device), edge_type.to(node_type_ids.device))
 
-        # encode the edges
-        trip_txt = self.edge_encoder.build_edge_text(concept_ids.to(node_type_ids.device), *adj)
-        edge_emb = self.edge_encoder.tokenize_and_encode(trip_txt, device=node_type_ids.device)
-
         # sent_vecs shape: (mini_batch_size*num_choice, d_LM)
         sent_vecs, all_hidden_states = self.encoder(*lm_inputs, layer_id=layer_id)
         logits, attn = self.decoder(sent_vecs.to(node_type_ids.device),
                                     concept_ids,
                                     node_type_ids, node_scores, adj_lengths, adj,
-                                    emb_data=None, cache_output=cache_output,
-                                    edge_emb=edge_emb)
+                                    emb_data=None, cache_output=cache_output)
         logits = logits.view(bs, nc)
         if not detail:
             return logits, attn
@@ -579,39 +447,38 @@ class GATConvE(MessagePassing):
                                        torch.nn.ReLU(),
                                        torch.nn.Linear(emb_dim, emb_dim))
 
-    def forward(self, x, edge_index, edge_type, node_type, node_feature_extra, edge_emb, return_attention_weights=False):
+    def forward(self, x, edge_index, edge_type, node_type, node_feature_extra, return_attention_weights=False):
         # x: [N, emb_dim]
         # edge_index: [2, E]
         # edge_type [E,] -> edge_attr: [E, 39] / self_edge_attr: [N, 39]
         # node_type [N,] -> headtail_attr [E, 8(=4+4)] / self_headtail_attr: [N, 8]
         # node_feature_extra [N, dim]
-        # edge_emb: [E, emb_dim]
 
         # Prepare edge feature
-        # edge_vec = make_one_hot(edge_type, self.n_etype + 1)  # [E, 39]
-        # self_edge_vec = torch.zeros(x.size(0), self.n_etype + 1).to(edge_vec.device)
-        # self_edge_vec[:, self.n_etype] = 1
+        edge_vec = make_one_hot(edge_type, self.n_etype + 1)  # [E, 39]
+        self_edge_vec = torch.zeros(x.size(0), self.n_etype + 1).to(edge_vec.device)
+        self_edge_vec[:, self.n_etype] = 1
 
-        # head_type = node_type[edge_index[0]]  # [E,] #head=src
-        # tail_type = node_type[edge_index[1]]  # [E,] #tail=tgt
-        # head_vec = make_one_hot(head_type, self.n_ntype)  # [E,4]
-        # tail_vec = make_one_hot(tail_type, self.n_ntype)  # [E,4]
-        # headtail_vec = torch.cat([head_vec, tail_vec], dim=1)  # [E,8]
-        # self_head_vec = make_one_hot(node_type, self.n_ntype)  # [N,4]
-        # self_headtail_vec = torch.cat([self_head_vec, self_head_vec], dim=1)  # [N,8]
+        head_type = node_type[edge_index[0]]  # [E,] #head=src
+        tail_type = node_type[edge_index[1]]  # [E,] #tail=tgt
+        head_vec = make_one_hot(head_type, self.n_ntype)  # [E,4]
+        tail_vec = make_one_hot(tail_type, self.n_ntype)  # [E,4]
+        headtail_vec = torch.cat([head_vec, tail_vec], dim=1)  # [E,8]
+        self_head_vec = make_one_hot(node_type, self.n_ntype)  # [N,4]
+        self_headtail_vec = torch.cat([self_head_vec, self_head_vec], dim=1)  # [N,8]
 
-        # edge_vec = torch.cat([edge_vec, self_edge_vec], dim=0)  # [E+N, ?]
-        # headtail_vec = torch.cat([headtail_vec, self_headtail_vec], dim=0)  # [E+N, ?]
-        # edge_embeddings = self.edge_encoder(torch.cat([edge_vec, headtail_vec], dim=1))  # [E+N, emb_dim]
+        edge_vec = torch.cat([edge_vec, self_edge_vec], dim=0)  # [E+N, ?]
+        headtail_vec = torch.cat([headtail_vec, self_headtail_vec], dim=0)  # [E+N, ?]
+        edge_embeddings = self.edge_encoder(torch.cat([edge_vec, headtail_vec], dim=1))  # [E+N, emb_dim]
 
         # Add self loops to edge_index
-        # loop_index = torch.arange(0, x.size(0), dtype=torch.long, device=edge_index.device)
-        # loop_index = loop_index.unsqueeze(0).repeat(2, 1)
-        # edge_index = torch.cat([edge_index, loop_index], dim=1)   # [2, E+N]
+        loop_index = torch.arange(0, x.size(0), dtype=torch.long, device=edge_index.device)
+        loop_index = loop_index.unsqueeze(0).repeat(2, 1)
+        edge_index = torch.cat([edge_index, loop_index], dim=1)   # [2, E+N]
 
         x = torch.cat([x, node_feature_extra], dim=1)
         x = (x, x)
-        aggr_out = self.propagate(edge_index, x=x, edge_attr=edge_emb)  # [N, emb_dim]
+        aggr_out = self.propagate(edge_index, x=x, edge_attr=edge_embeddings)  # [N, emb_dim]
         out = self.mlp(aggr_out)
 
         alpha = self._alpha

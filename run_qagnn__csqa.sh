@@ -4,8 +4,8 @@ dt=`date '+%Y%m%d_%H%M%S'`
 
 dataset="csqa"
 model='roberta-large'
-if [[ "$#" -gt 0 ]]; then shift; fi
-if [[ "$#" -gt 0 ]]; then shift; fi
+# if [[ "$#" -gt 0 ]]; then shift; fi
+# if [[ "$#" -gt 0 ]]; then shift; fi
 args=$@
 
 
