@@ -62,117 +62,124 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
             return obj.to(device)
 
 
-def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice, args):
-    cache_path = adj_pk_path +'.loaded_cache'
-    use_cache = True
+def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, num_choice, k, args):
+    """
+    Load the graph data. Reserve positions for the context nodes.
 
-    if use_cache and not os.path.exists(cache_path):
-        use_cache = False
+    Parameters:
+    -----------
+    k: int. Number of views of the context node.
+    """
+    with open(adj_pk_path, 'rb') as fin:
+        adj_concept_pairs = pickle.load(fin)
 
-    if use_cache:
-        with open(cache_path, 'rb') as f:
-            adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel = pickle.load(f)
-    else:
-        with open(adj_pk_path, 'rb') as fin:
-            adj_concept_pairs = pickle.load(fin)
+    n_samples = len(adj_concept_pairs)  # len = n_questions * n_choices
+    edge_index, edge_type = [], []
+    adj_lengths = torch.zeros((n_samples,), dtype=torch.long)
+    # max_node_num is 200 by default
+    concept_ids = torch.full((n_samples, max_node_num), 1, dtype=torch.long)
+    node_type_ids = torch.full((n_samples, max_node_num), 2, dtype=torch.long)  # default 2: "other node"
+    node_scores = torch.zeros((n_samples, max_node_num, 1), dtype=torch.float)
 
-        n_samples = len(adj_concept_pairs)  # len = n_questions * n_choices
-        edge_index, edge_type = [], []
-        adj_lengths = torch.zeros((n_samples,), dtype=torch.long)
-        # max_node_num is 200 by default
-        concept_ids = torch.full((n_samples, max_node_num), 1, dtype=torch.long)
-        node_type_ids = torch.full((n_samples, max_node_num), 2, dtype=torch.long)  # default 2: "other node"
-        node_scores = torch.zeros((n_samples, max_node_num, 1), dtype=torch.float)
+    # the concept vocab size is 799273
+    contextnode_start = 799273
 
-        adj_lengths_ori = adj_lengths.clone()
-        for idx, _data in tqdm(enumerate(adj_concept_pairs), total=n_samples, desc='loading adj matrices'):
-            adj, concepts, qm, am, cid2score = _data['adj'], _data['concepts'], _data['qmask'], _data['amask'], _data['cid2score']
-            # adj: (n_nodes*17, n_nodes) where 17 is the number of relation types; sparse matrix in COOrdinate format
-            # concepts: np.array(n_nodes,), where entry is concept id
-            # NOTE: concepts always start with question entities, then answer entities, then other entities.
-            # qm: np.array(n_nodes,), where entry is True/False
-            # am: np.array(n_nodes,), where entry is True/False
-            assert len(concepts) == len(set(concepts))
-            qam = qm | am
+    adj_lengths_ori = adj_lengths.clone()
+    for idx, _data in tqdm(enumerate(adj_concept_pairs), total=n_samples, desc='loading adj matrices'):
+        adj, concepts, qm, am, cid2score = (_data['adj'], _data['concepts'], _data['qmask'],
+                                            _data['amask'], _data['cid2score'])
+        # adj: (n_nodes*17, n_nodes) where 17 is the number of relation types; sparse matrix in COOrdinate format
+        # concepts: np.array(n_nodes,), where entry is concept id
+        # NOTE: concepts always start with question entities, then answer entities, then other entities.
+        # qm: np.array(n_nodes,), where entry is True/False
+        # am: np.array(n_nodes,), where entry is True/False
+        assert len(concepts) == len(set(concepts))  # distinct concepts
+        assert np.all(concepts < contextnode_start)  # cannot exceed concept vocab size
+        assert not np.any(qm & am)  # cannot simultaneously be True
+        qam = qm | am
 
-            # sanity check: should be T,..,T,F,F,..F
-            assert qam[0] == True
-            F_start = False
-            for TF in qam:
-                if TF == False:
-                    F_start = True
-                else:
-                    assert F_start == False
+        # sanity check: should be T,..,T,F,F,..F
+        assert qam[0] == True
+        F_start = False
+        for TF in qam:
+            if TF == False:
+                F_start = True
+            else:
+                assert F_start == False
 
-            # this is the final number of nodes including contextnode but excluding PAD
-            num_concept = min(len(concepts), max_node_num - 1) + 1
-            adj_lengths_ori[idx] = len(concepts)
-            adj_lengths[idx] = num_concept
+        # this is the final number of nodes including contextnode but excluding PAD
+        # num_concept <= max_node_num && num_concept - k <= len(concepts)
+        num_concept = min(len(concepts), max_node_num - k) + k
+        adj_lengths_ori[idx] = len(concepts)
+        adj_lengths[idx] = num_concept
 
-            # Prepare nodes. NOTE: length of concepts is num_concept - 1
-            concepts = concepts[:num_concept - 1]
-            # NOTE: to accomodate contextnode, original concept_ids incremented by 1
-            concept_ids[idx, 1:num_concept] = torch.tensor(concepts + 1)
-            concept_ids[idx, 0] = 0  # this is the "concept_id" for contextnode
+        # Prepare nodes. NOTE: number of KG concepts is num_concept - k
+        concepts = concepts[:num_concept - k]
+        concept_ids[idx, :num_concept - k] = torch.tensor(concepts)
+        # this is the "concept_id" for contextnodes
+        concept_ids[idx, num_concept - k:num_concept] = range(contextnode_start, contextnode_start + k)
 
-            # Prepare node scores
-            if (cid2score is not None):
-                for _j_ in range(num_concept):
-                    _cid = int(concept_ids[idx, _j_]) - 1
-                    assert _cid in cid2score
-                node_scores[idx, _j_, 0] = torch.tensor(cid2score[_cid])
+        # <--------200-------->
+        #             <-k->
+        # [           |   |   ]
+        # <--num_concept-->
 
-            # Prepare node types
-            node_type_ids[idx, 0] = 3  # contextnode
-            node_type_ids[idx, 1:num_concept][torch.tensor(qm, dtype=torch.bool)[:num_concept-1]] = 0
-            node_type_ids[idx, 1:num_concept][torch.tensor(am, dtype=torch.bool)[:num_concept-1]] = 1
+        # Prepare node scores
+        if cid2score is not None:
+            for _j_ in range(num_concept):
+                _cid = concept_ids[idx, _j_]  # concept id of the j-th node
+                if _cid in cid2score:
+                    node_scores[idx, _j_, 0] = torch.tensor(cid2score[_cid])
+                else:  # the contextnodes share the score at key=-1
+                    assert _cid >= contextnode_start  # make sure this is a contextnode
+                    node_scores[idx, _j_, 0] = torch.tensor(cid2score[-1])
 
-            # Load adj
-            ij = torch.tensor(adj.row, dtype=torch.int64)  # (num_matrix_entries, ), where each entry is coordinate
-            k = torch.tensor(adj.col, dtype=torch.int64)   # (num_matrix_entries, ), where each entry is coordinate
-            n_node = adj.shape[1]
-            half_n_rel = adj.shape[0] // n_node
-            # i: relation type, j: entity position. (j, k, i) is the (e1, e2, r) triplet.
-            # NOTE: j and k are index, not concept ids.
-            i, j = ij // n_node, ij % n_node
+        # Prepare node types
+        node_type_ids[idx, num_concept-k:num_concept] = 3  # contextnode
+        node_type_ids[idx, :num_concept-k][torch.tensor(qm, dtype=torch.bool)[:num_concept-k]] = 0
+        node_type_ids[idx, :num_concept-k][torch.tensor(am, dtype=torch.bool)[:num_concept-k]] = 1
 
-            # Prepare edges
-            i += 2; j += 1; k += 1  # **** increment coordinate by 1, rel_id by 2 ****
-            extra_i, extra_j, extra_k = [], [], []
+        # Load adj
+        ij = torch.tensor(adj.row, dtype=torch.int64)  # (num_matrix_entries, ), where each entry is coordinate
+        k = torch.tensor(adj.col, dtype=torch.int64)   # (num_matrix_entries, ), where each entry is coordinate
+        n_node = adj.shape[1]
+        half_n_rel = adj.shape[0] // n_node
+        # i: relation type, j: entity position. (j, k, i) is the (e1, e2, r) triplet.
+        # NOTE: j and k are index, not concept ids.
+        i, j = ij // n_node, ij % n_node
 
-            # add an edge between contextnode and each question/answer concept.
-            for _coord, q_tf in enumerate(qm):
-                _new_coord = _coord + 1
-                if _new_coord > num_concept:  # should be >= here I think
-                    break
-                if q_tf:
-                    extra_i.append(0)  # rel from contextnode to question concept
-                    extra_j.append(0)  # contextnode coordinate
-                    extra_k.append(_new_coord)  # question concept coordinate
-            for _coord, a_tf in enumerate(am):
-                _new_coord = _coord + 1
-                if _new_coord > num_concept:
-                    break
-                if a_tf:
-                    extra_i.append(1)  # rel from contextnode to answer concept
-                    extra_j.append(0)  # contextnode coordinate
-                    extra_k.append(_new_coord)  # answer concept coordinate
+        # Prepare edges
+        i += 2                                  # increment relation id by 2
+        extra_i, extra_j, extra_k = [], [], []  # edges connected to contextnodes
 
-            half_n_rel += 2  # should be 19 now
-            if len(extra_i) > 0:
-                i = torch.cat([i, torch.tensor(extra_i)], dim=0)
-                j = torch.cat([j, torch.tensor(extra_j)], dim=0)
-                k = torch.cat([k, torch.tensor(extra_k)], dim=0)
-            ########################
+        # iterate through KG concepts and add edges from contextnodes to them
+        for _coord in range(num_concept - k):
+            if not qam[_coord]:
+                continue  # skip non-QA nodes
 
-            mask = (j < max_node_num) & (k < max_node_num)
-            i, j, k = i[mask], j[mask], k[mask]
-            i, j, k = torch.cat((i, i + half_n_rel), 0), torch.cat((j, k), 0), torch.cat((k, j), 0)  # add inverse relations
-            edge_index.append(torch.stack([j, k], dim=0))  # each entry is [2, E]
-            edge_type.append(i)  # each entry is [E, ]
+            # add contextnodes as heading nodes
+            extra_j.extend(range(num_concept - k, num_concept))
 
-        with open(cache_path, 'wb') as f:
-            pickle.dump([adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel], f)
+            # add current KG concept as tailing node
+            extra_k.extend([_coord] * k)
+
+            # add edges with new relation types
+            extra_i.extend([0 if qm[_coord] else 1] * k)
+
+            # TODO: add edges among contextnodes
+
+        half_n_rel += 2  # should be 19 now
+        if len(extra_i) > 0:
+            i = torch.cat([i, torch.tensor(extra_i)], dim=0)
+            j = torch.cat([j, torch.tensor(extra_j)], dim=0)
+            k = torch.cat([k, torch.tensor(extra_k)], dim=0)
+        ########################
+
+        mask = (j < max_node_num) & (k < max_node_num)
+        i, j, k = i[mask], j[mask], k[mask]
+        i, j, k = torch.cat((i, i + half_n_rel), 0), torch.cat((j, k), 0), torch.cat((k, j), 0)  # add inverse relations
+        edge_index.append(torch.stack([j, k], dim=0))  # each entry is [2, E]
+        edge_type.append(i)  # each entry is [E, ]
 
     ori_adj_mean = adj_lengths_ori.float().mean().item()
     ori_adj_sigma = np.sqrt(((adj_lengths_ori.float() - ori_adj_mean)**2).mean().item())
@@ -187,7 +194,8 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
     # list of size (n_questions, n_choices), where each entry is tensor[E, ]
     edge_type = list(map(list, zip(*(iter(edge_type),) * num_choice)))
 
-    concept_ids, node_type_ids, node_scores, adj_lengths = [x.view(-1, num_choice, *x.size()[1:]) for x in (concept_ids, node_type_ids, node_scores, adj_lengths)]
+    concept_ids, node_type_ids, node_scores, adj_lengths = [
+        x.view(-1, num_choice, *x.size()[1:]) for x in (concept_ids, node_type_ids, node_scores, adj_lengths)]
     # concept_ids: (n_questions, num_choice, max_node_num)
     # node_type_ids: (n_questions, num_choice, max_node_num)
     # node_scores: (n_questions, num_choice, max_node_num)
