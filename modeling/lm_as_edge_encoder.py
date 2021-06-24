@@ -5,7 +5,11 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from transformers import BertModel, BertTokenizerFast
+try:
+    from transformers import BertModel, BertTokenizerFast
+except:
+    pass
+
 from utils.conceptnet import relation_text
 import os
 import numpy as np

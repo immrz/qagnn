@@ -53,7 +53,7 @@ def main():
     parser.add_argument('--mode', default='train', choices=['train', 'eval_detail'], help='run training or evaluation')
     parser.add_argument('--save_dir', default='./saved_models/qagnn/', help='model output directory')
     parser.add_argument('--save_model', dest='save_model', action='store_true', help='whether to save model')
-    parser.add_argument('--save_best_model_only', action='store_true',
+    parser.add_argument('--save_best_model_only', type=bool_flag, default=True, const=True, nargs='?',
                         help='only save best dev acc model instead of each epoch')
     parser.add_argument('--load_model_path', default=None)
 
