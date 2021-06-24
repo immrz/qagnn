@@ -10,6 +10,8 @@ except:
 from modeling.modeling_qagnn import LM_QAGNN, LM_QAGNN_DataLoader
 from modeling.lm_as_edge_encoder import LM_QAGNN_LAEE
 
+from multi_view.modeling_qagnn import Multiview_LM_QAGNN, Multiview_LM_QAGNN_DataLoader
+
 from utils.optimization_utils import OPTIMIZER_CLASSES
 from utils.parser_utils import get_parser
 from utils.utils import bool_flag, check_path, export_config, freeze_net, unfreeze_net, pretty_args
@@ -72,6 +74,7 @@ def main():
     parser.add_argument('--freeze_ent_emb', default=True, type=bool_flag, nargs='?',
                         const=True, help='freeze entity embedding layer')
     parser.add_argument('--lm_as_edge_encoder', action='store_true')
+    parser.add_argument('--views', nargs='+', default=None, help='types of the views of the context')
 
     parser.add_argument('--max_node_num', default=200, type=int)
     parser.add_argument('--simple', default=False, type=bool_flag, nargs='?', const=True)
@@ -140,21 +143,47 @@ def train(args):
     else:
         device0 = torch.device("cpu")
         device1 = torch.device("cpu")
-    dataset = LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
-                                  args.dev_statements, args.dev_adj,
-                                  args.test_statements, args.test_adj,
-                                  batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                  device=(device0, device1),
-                                  model_name=args.encoder,
-                                  max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
-                                  is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                  subsample=args.subsample, use_cache=args.use_cache)
+
+    if args.views is None:
+        dataset = LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
+                                      args.dev_statements, args.dev_adj,
+                                      args.test_statements, args.test_adj,
+                                      batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+                                      device=(device0, device1),
+                                      model_name=args.encoder,
+                                      max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
+                                      is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
+                                      subsample=args.subsample, use_cache=args.use_cache)
+    else:
+        dataset = Multiview_LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
+                                                args.dev_statements, args.dev_adj,
+                                                args.test_statements, args.test_adj,
+                                                batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+                                                device=(device0, device1),
+                                                model_name=args.encoder,
+                                                max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
+                                                is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
+                                                subsample=args.subsample, use_cache=args.use_cache, views=args.views)
 
     ###################################################################################################
     #   Build model                                                                                   #
     ###################################################################################################
 
-    if args.lm_as_edge_encoder:
+    if args.views is not None:  # use multi-view QAGNN
+        assert len(args.views) == 1  # TODO
+        assert not args.lm_as_edge_encoder
+        model = Multiview_LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
+                                   concept_dim=args.gnn_dim,
+                                   concept_in_dim=concept_dim,
+                                   n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
+                                   p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
+                                   pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
+                                   init_range=args.init_range,
+                                   encoder_config={}, views=args.views)
+        model.encoder.to(device0)
+        model.decoder.to(device1)
+
+    elif args.lm_as_edge_encoder:
         model = LM_QAGNN_LAEE(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
                               concept_dim=args.gnn_dim,
                               concept_in_dim=concept_dim,

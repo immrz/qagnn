@@ -116,14 +116,14 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
 
         # Prepare nodes. NOTE: number of KG concepts is num_real
         concepts = concepts[:num_real]
-        concept_ids[idx, :num_real] = torch.tensor(concepts)
+        concept_ids[idx, num_view:num_concept] = torch.tensor(concepts)
         # this is the "concept_id" for contextnodes
-        concept_ids[idx, num_real:num_concept] = torch.tensor(range(contextnode_start, contextnode_start + num_view))
+        concept_ids[idx, :num_view] = torch.tensor(range(contextnode_start, contextnode_start + num_view))
 
         #  <----------------200---------------->
         #  <----------num_concept---------->
-        # [                  |              |   ]
-        #  <----num_real----> <--num_view-->
+        # [              |                  |   ]
+        #  <--num_view--> <----num_real---->
 
         # Prepare node scores
         if cid2score is not None:
@@ -136,9 +136,9 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
                     node_scores[idx, _j_, 0] = torch.tensor(cid2score[-1])
 
         # Prepare node types
-        node_type_ids[idx, num_real:num_concept] = 3  # contextnode
-        node_type_ids[idx, :num_real][torch.tensor(qm, dtype=torch.bool)[:num_real]] = 0
-        node_type_ids[idx, :num_real][torch.tensor(am, dtype=torch.bool)[:num_real]] = 1
+        node_type_ids[idx, :num_view] = 3  # contextnode
+        node_type_ids[idx, num_view:num_concept][torch.tensor(qm, dtype=torch.bool)[:num_real]] = 0
+        node_type_ids[idx, num_view:num_concept][torch.tensor(am, dtype=torch.bool)[:num_real]] = 1
 
         # Load adj
         ij = torch.tensor(adj.row, dtype=torch.int64)  # (num_matrix_entries, ), where each entry is coordinate
@@ -151,6 +151,7 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
 
         # Prepare edges
         i += 2                                  # increment relation id by 2
+        j, k = j + num_view, k + num_view       # increment index by num_view
         extra_i, extra_j, extra_k = [], [], []  # edges connected to contextnodes
 
         # iterate through KG concepts and add edges from contextnodes to them
@@ -159,10 +160,10 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
                 continue  # skip non-QA nodes
 
             # add contextnodes as heading nodes
-            extra_j.extend(range(num_real, num_concept))
+            extra_j.extend(range(num_view))
 
-            # add current KG concept as tailing node
-            extra_k.extend([_coord] * num_view)
+            # add current KG concept as tailing node; NOTE: index shifted by num_view
+            extra_k.extend([_coord + num_view] * num_view)
 
             # add edges with new relation types
             extra_i.extend([0 if qm[_coord] else 1] * num_view)
