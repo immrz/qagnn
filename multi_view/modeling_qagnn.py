@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import math
+import os
 
 
 class QAGNN_Message_Passing(nn.Module):
@@ -214,18 +215,18 @@ class Multiview_LM_QAGNN(nn.Module):
                  init_range=0.0, encoder_config={}, views=None):
         super().__init__()
         self.views = views
-        self.num_views = 1 if views is None else len(views) + 1
+        self.num_view = args.num_view
         self.encoder = TextEncoder(model_name, **encoder_config)
         self.decoder = QAGNN(args, k, n_ntype, n_etype, self.encoder.sent_dim,
                              n_concept, concept_dim, concept_in_dim, n_attention_head,
                              fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                              pretrained_concept_emb=pretrained_concept_emb, freeze_ent_emb=freeze_ent_emb,
-                             init_range=init_range, num_view=self.num_views)
+                             init_range=init_range, num_view=self.num_view)
 
     def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
         """
-        sent_vecs: (batch_size, num_choice, d_sent)    -> (batch_size * num_choice, d_sent)
-        token_type_ids and attention_mask, etc.
+        inputs: list of (batch_size, num_choice, V, d_sent)    -> (batch_size * num_choice, V, d_sent)
+            token_ids and attention_mask, etc.
 
         concept_ids: (batch_size, num_choice, n_node)  -> (batch_size * num_choice, n_node)
         node_type_ids: (batch_size, num_choice, n_node) -> (batch_size * num_choice, n_node)
@@ -253,18 +254,27 @@ class Multiview_LM_QAGNN(nn.Module):
         # here lm_inputs contains all the embeddings needed by the LM
         *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type = _inputs
 
+        # the lm_inputs should be further flattened
+        assert len(lm_inputs[0].shape) == 3
+        lm_inputs = [x.view(-1, x.size(-1)) for x in lm_inputs]
+
         # edge_index: [2, total_E]   edge_type: [total_E, ]
         edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
         adj = (edge_index.to(node_type_ids.device), edge_type.to(node_type_ids.device))
 
-        # sent_vecs shape: (mini_batch_size*num_choice, d_LM)
+        # sent_vecs shape: (mini_batch_size*num_choice*V, d_LM)
         sent_vecs, all_hidden_states = self.encoder(*lm_inputs, layer_id=layer_id)
+        # unflatten shape: (mini_batch_size*num_choice, V, d_LM)
+        lm_emb = sent_vecs.view(bs*nc, -1, sent_vecs.size(-1))
 
-        # average of word embeddings as a view; shape (mini_batch_size*num_choice, d_LM)
-        view_avg = torch.mean(all_hidden_states[0], dim=1)
+        if 'mean' in self.views:
+            # average of word embeddings as a view; shape (mini_batch_size*num_choice, 1, d_LM)
+            word_emb = all_hidden_states[0]
+            word_emb = word_emb.view(bs*nc, -1, *word_emb.size()[1:])[:, 0, ...]
+            view_avg = torch.mean(all_hidden_states[0], dim=1).unsqueeze(1)
 
-        # stack multi views of the LM embedding; shape (mini_batch_size*num_choice, k, d_LM)
-        lm_emb = torch.stack((sent_vecs, view_avg), dim=1)
+            # stack multi views of the LM embedding; shape (mini_batch_size*num_choice, V', d_LM)
+            lm_emb = torch.cat((sent_vecs, view_avg), dim=1)
 
         logits, attn = self.decoder(lm_emb.to(node_type_ids.device),
                                     concept_ids,
@@ -295,22 +305,38 @@ class Multiview_LM_QAGNN_DataLoader(object):
                  test_statement_path, test_adj_path,
                  batch_size, eval_batch_size, device, model_name, max_node_num=200, max_seq_length=128,
                  is_inhouse=False, inhouse_train_qids_path=None,
-                 subsample=1.0, use_cache=True, views=None):
+                 subsample=1.0, use_cache=True, num_view=1, num_mask_view=0):
         super().__init__()
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.device0, self.device1 = device
         self.is_inhouse = is_inhouse
-        self.num_view = 1 if views is None else len(views) + 1
+        self.num_view = num_view
+        self.num_mask_view = num_mask_view
 
         model_type = MODEL_NAME_TO_CLASS[model_name]
         print('train_statement_path', train_statement_path)
 
+        train_ground_path, dev_ground_path, test_ground_path = (
+            os.path.join(os.environ.get('AMLT_DATA_DIR', 'data'),
+                         args.dataset,
+                         'grounded',
+                         f'{split}.grounded.jsonl') for split in ['train', 'dev', 'test'])
+        if num_mask_view > 0:
+            print('train_ground_path', train_ground_path)
+
         # the LM features, e.g., token_ids, attention_mask, etc.
+        # NOTE: the shape of the tensors is (N, num_choice, num_mask_view+1, seq_len)
         self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(
-            train_statement_path, model_type, model_name, max_seq_length)
+            train_statement_path, model_type,
+            model_name, max_seq_length,
+            num_mask_view=self.num_mask_view, ground_path=train_ground_path,
+        )
         self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(
-            dev_statement_path, model_type, model_name, max_seq_length)
+            dev_statement_path, model_type,
+            model_name, max_seq_length,
+            num_mask_view=self.num_mask_view, ground_path=dev_ground_path,
+        )
 
         num_choice = self.train_encoder_data[0].size(1)
         self.num_choice = num_choice
@@ -327,7 +353,10 @@ class Multiview_LM_QAGNN_DataLoader(object):
 
         if test_statement_path is not None:
             self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(
-                test_statement_path, model_type, model_name, max_seq_length)
+                test_statement_path, model_type,
+                model_name, max_seq_length,
+                num_mask_view=self.num_mask_view, ground_path=test_ground_path,
+            )
             *self.test_decoder_data, self.test_adj_data = load_sparse_adj_data_with_multi_view_contextnode(
                 test_adj_path, max_node_num, num_choice, self.num_view, args)
             assert all(len(self.test_qids) == len(self.test_adj_data[0]) == x.size(0)

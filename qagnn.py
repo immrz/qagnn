@@ -99,6 +99,20 @@ def main():
         parser.set_defaults(k=1)
     args = parser.parse_args()
 
+    # set num of views
+    args.num_view = 1
+    args.num_mask_view = 0
+    if args.views is not None:
+        for v in args.views:
+            if v in ['mean']:
+                args.num_view += 1
+            elif v.startswith('mask'):
+                assert len(v) == 5, 'mask view format should be `mask{n}`'
+                args.num_mask_view = int(v[-1])
+                args.num_view += args.num_mask_view
+            else:
+                raise NotImplementedError
+
     if args.mode == 'train':
         train(args)
     elif args.mode == 'eval_detail':
@@ -163,14 +177,14 @@ def train(args):
                                                 model_name=args.encoder,
                                                 max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
                                                 is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                                subsample=args.subsample, use_cache=args.use_cache, views=args.views)
+                                                subsample=args.subsample, use_cache=args.use_cache,
+                                                num_view=args.num_view, num_mask_view=args.num_mask_view)
 
     ###################################################################################################
     #   Build model                                                                                   #
     ###################################################################################################
 
     if args.views is not None:  # use multi-view QAGNN
-        assert len(args.views) == 1  # TODO
         assert not args.lm_as_edge_encoder
         model = Multiview_LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
                                    concept_dim=args.gnn_dim,
