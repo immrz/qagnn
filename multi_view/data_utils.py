@@ -551,10 +551,9 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
                                             pad_token_segment_id=4 if model_type in ['xlnet'] else 0,
                                             sequence_b_segment_id=0 if model_type in ['roberta', 'albert'] else 1)
     example_ids = [f.example_id for f in features]
-    *data_tensors, all_label = convert_features_to_tensors(features)
 
-    # shape (N, num_choice*V, L) -> (N, num_choice, V, L)
-    data_tensors = [t.view(t.size(0), -1, num_mask_view + 1, *t.size()[2:]) for t in data_tensors]
+    # tensors shape (N, num_choice*V, L)
+    *data_tensors, all_label = convert_features_to_tensors(features)
     return (example_ids, all_label, *data_tensors)
 
 

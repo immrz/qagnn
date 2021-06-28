@@ -225,7 +225,7 @@ class Multiview_LM_QAGNN(nn.Module):
 
     def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
         """
-        inputs: list of (batch_size, num_choice, V, d_sent)    -> (batch_size * num_choice, V, d_sent)
+        inputs: list of (batch_size, num_choice * V, d_sent)    -> (batch_size * num_choice * V, d_sent)
             token_ids and attention_mask, etc.
 
         concept_ids: (batch_size, num_choice, n_node)  -> (batch_size * num_choice, n_node)
@@ -242,10 +242,10 @@ class Multiview_LM_QAGNN(nn.Module):
                 -> (total E,)
         returns: (batch_size, num_choice)
         """
-        # bs: mini_batch_size, nc: number of answer choices
-        bs, nc = inputs[0].size(0), inputs[0].size(1)
 
-        # Here, merge the batch dimension and the num_choice dimension
+        # bs: mini_batch_size, nc: number of answer choices
+        bs, nc = inputs[-6].size(0), inputs[-6].size(1)
+
         edge_index_orig, edge_type_orig = inputs[-2:]
 
         # flatten the torch tensors and lists along the first two dim
@@ -253,10 +253,6 @@ class Multiview_LM_QAGNN(nn.Module):
 
         # here lm_inputs contains all the embeddings needed by the LM
         *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type = _inputs
-
-        # the lm_inputs should be further flattened
-        assert len(lm_inputs[0].shape) == 3
-        lm_inputs = [x.view(-1, x.size(-1)) for x in lm_inputs]
 
         # edge_index: [2, total_E]   edge_type: [total_E, ]
         edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
@@ -269,8 +265,8 @@ class Multiview_LM_QAGNN(nn.Module):
 
         if 'mean' in self.views:
             # average of word embeddings as a view; shape (mini_batch_size*num_choice, 1, d_LM)
-            word_emb = all_hidden_states[0]
-            word_emb = word_emb.view(bs*nc, -1, *word_emb.size()[1:])[:, 0, ...]
+            word_emb = all_hidden_states[0]  # (mbs*num_choice*V, seq_len, d_LM)
+            word_emb = word_emb.view(bs*nc, -1, *word_emb.size()[1:])[:, 0, ...]  # (mbs*num_choice, seq_len, d_LM)
             view_avg = torch.mean(word_emb, dim=1, keepdim=True)
 
             # stack multi views of the LM embedding; shape (mini_batch_size*num_choice, V', d_LM)
@@ -338,7 +334,7 @@ class Multiview_LM_QAGNN_DataLoader(object):
             num_mask_view=self.num_mask_view, ground_path=dev_ground_path,
         )
 
-        num_choice = self.train_encoder_data[0].size(1)
+        num_choice = self.train_encoder_data[0].size(1) // (self.num_mask_view + 1)
         self.num_choice = num_choice
         print('num_choice', num_choice)
         *self.train_decoder_data, self.train_adj_data = load_sparse_adj_data_with_multi_view_contextnode(
