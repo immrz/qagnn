@@ -271,10 +271,10 @@ class Multiview_LM_QAGNN(nn.Module):
             # average of word embeddings as a view; shape (mini_batch_size*num_choice, 1, d_LM)
             word_emb = all_hidden_states[0]
             word_emb = word_emb.view(bs*nc, -1, *word_emb.size()[1:])[:, 0, ...]
-            view_avg = torch.mean(all_hidden_states[0], dim=1).unsqueeze(1)
+            view_avg = torch.mean(word_emb, dim=1, keepdim=True)
 
             # stack multi views of the LM embedding; shape (mini_batch_size*num_choice, V', d_LM)
-            lm_emb = torch.cat((sent_vecs, view_avg), dim=1)
+            lm_emb = torch.cat((lm_emb, view_avg), dim=1)
 
         logits, attn = self.decoder(lm_emb.to(node_type_ids.device),
                                     concept_ids,
