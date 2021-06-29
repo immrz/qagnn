@@ -137,7 +137,7 @@ def train(args):
     export_config(args, config_path)
     check_path(model_path)
     with open(log_path, 'w') as fout:
-        fout.write('step,dev_acc,test_acc\n')
+        fout.write('step,train_acc,dev_acc,test_acc\n')
 
     ###################################################################################################
     #   Load data                                                                                     #
@@ -277,44 +277,72 @@ def train(args):
     freeze_net(model.encoder)
 
     for epoch_id in range(args.n_epochs):
+        train_logits, train_labels, train_acc = [], [], 0.0
+
         if epoch_id == args.unfreeze_epoch:
             unfreeze_net(model.encoder)
         if epoch_id == args.refreeze_epoch:
             freeze_net(model.encoder)
         model.train()
+
+        # for each batch
         for qids, labels, *input_data in dataset.train():
             optimizer.zero_grad()
             bs = labels.size(0)
+            train_labels.append(labels)
+
+            # for each mini batch
             for a in range(0, bs, args.mini_batch_size):
                 b = min(a + args.mini_batch_size, bs)
                 logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
 
+                # save logits
+                train_logits.append(logits.detach().clone())
+
+                # compute loss
                 if args.loss == 'margin_rank':
                     num_choice = logits.size(1)
                     flat_logits = logits.view(-1)
                     correct_mask = F.one_hot(labels, num_classes=num_choice).view(-1)  # of length batch_size*num_choice
-                    correct_logits = flat_logits[correct_mask == 1].contiguous().view(-1, 1).expand(-1, num_choice - 1).contiguous().view(-1)  # of length batch_size*(num_choice-1)
+                    # length: batch_size*(num_choice-1)
+                    correct_logits = flat_logits[correct_mask == 1].contiguous() \
+                                                                   .view(-1, 1) \
+                                                                   .expand(-1, num_choice - 1) \
+                                                                   .contiguous() \
+                                                                   .view(-1)
+
                     wrong_logits = flat_logits[correct_mask == 0]
                     y = wrong_logits.new_ones((wrong_logits.size(0),))
                     loss = loss_func(correct_logits, wrong_logits, y)  # margin ranking loss
+
                 elif args.loss == 'cross_entropy':
                     loss = loss_func(logits, labels[a:b])
+
                 loss = loss * (b - a) / bs
-                loss.backward()
+                loss.backward()  # gradient accumulation
                 total_loss += loss.item()
+
             if args.max_grad_norm > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             scheduler.step()
             optimizer.step()
 
+            # batch logging
             if (global_step + 1) % args.log_interval == 0:
                 total_loss /= args.log_interval
                 ms_per_batch = 1000 * (time.time() - start_time) / args.log_interval
-                print('| step {:5} |  lr: {:9.7f} | loss {:7.4f} | ms/batch {:7.2f} |'.format(global_step, scheduler.get_lr()[0], total_loss, ms_per_batch))
+                print('| step {:5} |  lr: {:9.7f} | loss {:7.4f} | ms/batch {:7.2f} |'.format(
+                    global_step, scheduler.get_lr()[0], total_loss, ms_per_batch))
                 total_loss = 0
                 start_time = time.time()
             global_step += 1
 
+        # compute train accuracy
+        train_logits = torch.cat(train_logits, dim=0)
+        train_labels = torch.cat(train_labels, dim=0)
+        train_acc = (train_logits.argmax(1) == train_labels).sum().item() / train_labels.size(0)
+
+        # compute dev and test accuracy
         model.eval()
         dev_acc = evaluate_accuracy(dataset.dev(), model)
         save_test_preds = args.save_model
@@ -327,23 +355,27 @@ def train(args):
             preds_path = os.path.join(args.save_dir, 'test_e{}_preds.csv'.format(epoch_id))
             with open(preds_path, 'w') as f_preds:
                 with torch.no_grad():
-                    for qids, labels, *input_data in tqdm(eval_set):
+                    for qids, labels, *input_data in eval_set:
                         count += 1
                         logits, _, concept_ids, node_type_ids, edge_index, edge_type = model(*input_data, detail=True)
-                        predictions = logits.argmax(1) #[bsize, ]
-                        preds_ranked = (-logits).argsort(1) #[bsize, n_choices]
-                        for i, (qid, label, pred, _preds_ranked, cids, ntype, edges, etype) in enumerate(zip(qids, labels, predictions, preds_ranked, concept_ids, node_type_ids, edge_index, edge_type)):
-                            acc = int(pred.item()==label.item())
-                            print ('{},{}'.format(qid, chr(ord('A') + pred.item())), file=f_preds)
+                        predictions = logits.argmax(1)  # [bsize, ]
+                        preds_ranked = (-logits).argsort(1)  # [bsize, n_choices]
+                        for i, (qid, label, pred, _preds_ranked, cids, ntype, edges, etype) in \
+                                enumerate(zip(qids, labels, predictions, preds_ranked,
+                                              concept_ids, node_type_ids, edge_index, edge_type)):
+                            acc = int(pred.item() == label.item())
+                            print('{},{}'.format(qid, chr(ord('A') + pred.item())), file=f_preds)
                             f_preds.flush()
                             total_acc.append(acc)
-            test_acc = float(sum(total_acc))/len(total_acc)
+            test_acc = float(sum(total_acc)) / len(total_acc)
 
-        print('-' * 71)
-        print('| epoch {:3} | step {:5} | dev_acc {:7.4f} | test_acc {:7.4f} |'.format(epoch_id, global_step, dev_acc, test_acc))
-        print('-' * 71)
+        # epoch logging and save accuracy
+        print('-' * 90)
+        print('| epoch {:3} | step {:5} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} |'.format(
+            epoch_id, global_step, train_acc, dev_acc, test_acc))
+        print('-' * 90)
         with open(log_path, 'a') as fout:
-            fout.write('{},{},{}\n'.format(global_step, dev_acc, test_acc))
+            fout.write('{},{},{},{}\n'.format(global_step, train_acc, dev_acc, test_acc))
 
         if dev_acc >= best_dev_acc:
             best_dev_acc = dev_acc
