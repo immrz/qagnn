@@ -10,6 +10,7 @@ except:
 
 import json
 from tqdm import tqdm
+from typing import List
 
 GPT_SPECIAL_TOKENS = ['_start_', '_delimiter_', '_classify_']
 
@@ -136,7 +137,8 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
                     node_scores[idx, _j_, 0] = torch.tensor(cid2score[-1])
 
         # Prepare node types
-        node_type_ids[idx, :num_view] = 3  # contextnode
+        node_type_ids[idx, 0] = 3  # contextnode
+        node_type_ids[idx, 1:num_view] = 4 if args.view_special_node_type else 3  # views of contextnode
         node_type_ids[idx, num_view:num_concept][torch.tensor(qm, dtype=torch.bool)[:num_real]] = 0
         node_type_ids[idx, num_view:num_concept][torch.tensor(am, dtype=torch.bool)[:num_real]] = 1
 
@@ -284,8 +286,7 @@ def get_gpt_token_num():
     return len(tokenizer)
 
 
-def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, model_name, max_seq_length,
-                                          num_mask_view=0, ground_path=None):
+def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, model_name, max_seq_length, args):
     class InputExample(object):
 
         def __init__(self, example_id, question, contexts, endings, label=None):
@@ -310,66 +311,22 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
             ]
             self.label = label
 
-    def generate_views(s: str, concepts: list, n: int, mask_token: str) -> list:
-        origin_s = s
-        s = s.lower()
-        spans = []
-        views = [origin_s]  # will contain itself
+    def generate_views(s: str, n: int, p: float, tokenizer: RobertaTokenizer) -> List[List[str]]:
+        """Mask tokens in s with probability p, for n times.
+        """
+        tokens = np.array(tokenizer.tokenize(s))
+        views = np.stack([tokens for _ in range(n + 1)], axis=0)
+        prob = np.random.uniform(size=views.shape)
+        prob[0, :] = 1.0  # this is the original sentence
+        views[prob < p] = tokenizer.mask_token
+        return views.tolist()
 
-        if n == 0:
-            return views
-
-        # remove subconcepts first
-        pruned = []
-        for c in concepts:
-            if all([c not in another for another in concepts if c != another]):
-                pruned.append(c)
-        concepts = pruned
-
-        # loop all concepts
-        for c in concepts:
-            c = c.lower().replace('_', ' ')
-            if c not in s:
-                continue
-            start = s.index(c)
-            end = start + len(c)
-            spans.append((start, end))
-
-        # if not enough, randomly pick tokens
-        if len(spans) < n:
-            m = n - len(spans)
-            tokens = s.split()
-            slct = np.random.choice(tokens, m, replace=(m > len(tokens))).tolist()
-            for c in slct:
-                start = s.index(c)
-                end = start + len(c)
-                spans.append((start, end))
-
-        # len(spans) >= n; now construct views
-        spans = [spans[i] for i in np.random.choice(len(spans), n, replace=False).tolist()]
-        for start, end in spans:
-            views.append(origin_s[:start] + mask_token + origin_s[end:])
-
-        return views
-
-    def read_examples_and_mask(statement_path, ground_path, num_mask_view, mask_token):
-        # read question concepts
-        with open(ground_path, 'r', encoding='utf8') as fi:
-            all_qc = [set(json.loads(line)["qc"]) for line in fi]
-
+    def read_examples_and_mask(statement_path, num_mask_view, mask_view_prob, tokenizer):
         # read statements
         with open(statement_path, 'r', encoding='utf8') as fi:
             statements = fi.readlines()
 
-        assert len(all_qc) % len(statements) == 0
-        num_choice = len(all_qc) // len(statements)
-
-        # reshape all_qc to (N, num_choice) and then take the union along choices
-        all_qc = zip(*(iter(all_qc),) * num_choice)
-        all_qc = [set.union(*qc) for qc in all_qc]  # length is N
-        assert len(all_qc) == len(statements)
-
-        # original and masked contexts
+        # all the examples
         examples = []
 
         for i, line in enumerate(statements):
@@ -382,18 +339,16 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
                 contexts = json_dic["fact1"] + " " + contexts
 
             choices = json_dic["question"]["choices"]  # the answer choices
-            assert len(choices) == num_choice
 
-            # generate views for the question
-            views = generate_views(contexts, all_qc[i], num_mask_view, mask_token)
-            views = views * num_choice
+            # generate views for the question; here the views are already tokenized
+            views = generate_views(contexts, num_mask_view, mask_view_prob, tokenizer)  # List[List[str]]
+            views = [v.copy() for _ in range(len(choices)) for v in views]  # List[List[str]]
 
             # construct endings
-            endings = [[c["text"]] * (num_mask_view+1) for c in choices]
-            endings = [ei for e in endings for ei in e]  # flatten
+            endings = [c["text"] for c in choices for _ in range(num_mask_view + 1)]
 
             # check length
-            assert len(views) == len(endings) and len(views) == (num_mask_view + 1) * num_choice
+            assert len(views) == len(endings) and len(views) == (num_mask_view + 1) * len(choices)
 
             examples.append(
                 InputExample(
@@ -430,7 +385,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         for ex_index, example in enumerate(examples):
             choices_features = []
             for ending_idx, (context, ending) in enumerate(zip(example.contexts, example.endings)):
-                tokens_a = tokenizer.tokenize(context)
+                tokens_a = context.copy()  # already tokenized
                 tokens_b = tokenizer.tokenize(example.question + " " + ending)
 
                 special_tokens_count = 4 if sep_token_extra else 3
@@ -539,7 +494,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer}.get(model_type)
     tokenizer = tokenizer_class.from_pretrained(model_name)
 
-    examples = read_examples_and_mask(statement_jsonl_path, ground_path, num_mask_view, tokenizer.mask_token)
+    examples = read_examples_and_mask(statement_jsonl_path, args.num_mask_view, args.mask_view_prob, tokenizer)
 
     features = convert_examples_to_features(examples, list(range(len(examples[0].endings))), max_seq_length, tokenizer,
                                             cls_token_at_end=bool(model_type in ['xlnet']),  # xlnet has a cls token at the end
@@ -557,7 +512,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
     return (example_ids, all_label, *data_tensors)
 
 
-def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length, num_mask_view=0, ground_path=None):
+def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length, args):
     if model_type in ('lstm',):
         raise NotImplementedError
     elif model_type in ('gpt',):
@@ -567,8 +522,7 @@ def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length,
                                                      model_type,
                                                      model_name,
                                                      max_seq_length,
-                                                     num_mask_view=num_mask_view,
-                                                     ground_path=ground_path)
+                                                     args)
 
 
 def load_info(statement_path: str):

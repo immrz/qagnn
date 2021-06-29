@@ -1,5 +1,5 @@
 import argparse
-from utils.utils import *
+from utils.utils import bool_flag
 from modeling.modeling_encoder import MODEL_NAME_TO_CLASS
 import os
 
@@ -97,6 +97,27 @@ def add_additional_arguments(parser):
         parser.set_defaults(batch_size=1, log_interval=1, eval_interval=5)
 
 
+def add_multi_view_arguments(parser):
+    parser.add_argument('--views', default=None, nargs='+', help='type of context views')
+    args, _ = parser.parse_known_args()
+    if args.views is None:
+        return
+
+    num_view, num_mask_view = 1 + len(args.views), 0
+    for v in args.views:
+        if v.startswith('mask'):
+            assert len(v) == 5, 'mask view format should be `mask{n}`'
+            num_mask_view = int(v[-1])
+        elif v not in ['mean']:  # pre-defined view candidates
+            raise NotImplementedError
+
+    parser.add_argument('--num_view', default=num_view, type=int)
+    parser.add_argument('--num_mask_view', default=num_mask_view, type=int)
+    parser.add_argument('--mask_view_prob', default=0.15, type=float)
+    parser.add_argument('-vsnt', '--view_special_node_type', action='store_true',
+                        help='use special node type id for views')
+
+
 def get_parser():
     """A helper function that handles the arguments that all models share"""
     parser = argparse.ArgumentParser(add_help=False)
@@ -104,6 +125,7 @@ def get_parser():
     add_encoder_arguments(parser)
     add_optimization_arguments(parser)
     add_additional_arguments(parser)
+    add_multi_view_arguments(parser)
     return parser
 
 

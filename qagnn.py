@@ -74,7 +74,6 @@ def main():
     parser.add_argument('--freeze_ent_emb', default=True, type=bool_flag, nargs='?',
                         const=True, help='freeze entity embedding layer')
     parser.add_argument('--lm_as_edge_encoder', action='store_true')
-    parser.add_argument('--views', nargs='+', default=None, help='types of the views of the context')
 
     parser.add_argument('--max_node_num', default=200, type=int)
     parser.add_argument('--simple', default=False, type=bool_flag, nargs='?', const=True)
@@ -98,20 +97,6 @@ def main():
     if args.simple:
         parser.set_defaults(k=1)
     args = parser.parse_args()
-
-    # set num of views
-    args.num_view = 1
-    args.num_mask_view = 0
-    if args.views is not None:
-        for v in args.views:
-            if v in ['mean']:
-                args.num_view += 1
-            elif v.startswith('mask'):
-                assert len(v) == 5, 'mask view format should be `mask{n}`'
-                args.num_mask_view = int(v[-1])
-                args.num_view += args.num_mask_view
-            else:
-                raise NotImplementedError
 
     if args.mode == 'train':
         train(args)
