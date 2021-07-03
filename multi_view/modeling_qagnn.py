@@ -113,6 +113,7 @@ class QAGNN(nn.Module):
             The pretrained node embedding dimension.
         """
         super().__init__()
+        self.args = args
         self.init_range = init_range
         self.num_view = num_view
 
@@ -160,14 +161,12 @@ class QAGNN(nn.Module):
 
         returns: (batch_size, 1)
         """
-
-        # check shape of sent_vecs
-        assert len(sent_vecs.shape) == 3 and sent_vecs.size(1) == self.num_view
+        num_view = sent_vecs.size(1)
 
         # emb of the *pseudo* node, i.e., the QA context. (batch_size, k, dim_node)
         gnn_input0 = self.activation(self.svec2nvec(sent_vecs))
         # emb of the KG nodes. (batch_size, n_node-k, dim_node)
-        gnn_input1 = self.concept_emb(concept_ids[:, self.num_view:], emb_data)
+        gnn_input1 = self.concept_emb(concept_ids[:, num_view:], emb_data)
         gnn_input1 = gnn_input1.to(node_type_ids.device)
         # concatenation followed by dropout. (batch_size, n_node, dim_node)
         gnn_input = self.dropout_e(torch.cat([gnn_input0, gnn_input1], dim=1))
@@ -216,6 +215,7 @@ class Multiview_LM_QAGNN(nn.Module):
         super().__init__()
         self.views = views
         self.num_view = args.num_view
+        self.view_only_train = args.view_only_train
         self.encoder = TextEncoder(model_name, **encoder_config)
 
         # if needs to distinguish original contextnode from its views
@@ -264,14 +264,21 @@ class Multiview_LM_QAGNN(nn.Module):
 
         # sent_vecs shape: (mini_batch_size*num_choice*V, d_LM)
         sent_vecs, all_hidden_states = self.encoder(*lm_inputs, layer_id=layer_id)
+
         # unflatten shape: (mini_batch_size*num_choice, V, d_LM)
         sent_vecs = sent_vecs.view(bs*nc, -1, sent_vecs.size(-1))
-        # reduce embeddings of the masked views into one
-        sent_vecs = torch.stack([sent_vecs[:, 0, :],
-                                 torch.mean(sent_vecs[:, 1:, :], dim=1)],
-                                dim=1)
 
-        if 'mean' in self.views:
+        # reduce embeddings of the masked views into one
+        use_view_emb = self.training or not self.view_only_train
+        if sent_vecs.size(1) > 1:
+            if use_view_emb:
+                sent_vecs = torch.stack([sent_vecs[:, 0, :],
+                                         torch.mean(sent_vecs[:, 1:, :], dim=1)],
+                                        dim=1)
+            else:
+                sent_vecs = sent_vecs[:, 0:1, :]
+
+        if 'mean' in self.views and use_view_emb:
             # average of word embeddings as a view; shape (mini_batch_size*num_choice, 1, d_LM)
             word_emb = all_hidden_states[0]  # (mbs*num_choice*V, seq_len, d_LM)
             word_emb = word_emb.view(bs*nc, -1, *word_emb.size()[1:])[:, 0, ...]  # (mbs*num_choice, seq_len, d_LM)
@@ -309,33 +316,52 @@ class Multiview_LM_QAGNN_DataLoader(object):
                  test_statement_path, test_adj_path,
                  batch_size, eval_batch_size, device, model_name, max_node_num=200, max_seq_length=128,
                  is_inhouse=False, inhouse_train_qids_path=None,
-                 subsample=1.0, use_cache=True, num_view=1, num_mask_view=0):
+                 subsample=1.0, use_cache=True, num_view=1, num_mask_view=0,
+                 mask_view_prob=0.15, view_only_train=False):
         super().__init__()
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.device0, self.device1 = device
         self.is_inhouse = is_inhouse
-        self.num_view = num_view
-        self.num_mask_view = num_mask_view
 
         model_type = MODEL_NAME_TO_CLASS[model_name]
         print('train_statement_path', train_statement_path)
 
+        test_num_view = 1 if view_only_train else num_view
+        test_num_mask = 0 if view_only_train else num_mask_view
+        print(f'For dev and test, #view and #mask are {test_num_view}, {test_num_mask}.')
+
         # the LM features, e.g., token_ids, attention_mask, etc.
         # NOTE: the shape of the tensors is (N, num_choice, num_mask_view+1, seq_len)
         self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(
-            train_statement_path, model_type, model_name, max_seq_length, args)
+            train_statement_path, model_type, model_name, max_seq_length,
+            num_mask_view=num_mask_view, mask_view_prob=mask_view_prob,
+        )
         self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(
-            dev_statement_path, model_type, model_name, max_seq_length, args)
+            dev_statement_path, model_type, model_name, max_seq_length,
+            num_mask_view=test_num_mask, mask_view_prob=mask_view_prob,
+        )
 
-        num_choice = self.train_encoder_data[0].size(1) // (self.num_mask_view + 1)
+        # if use inhouse test set
+        if self.is_inhouse:
+            with open(inhouse_train_qids_path, 'r') as fin:
+                inhouse_qids = set(line.strip() for line in fin)
+            self.inhouse_train_indexes = torch.tensor([i for i, qid in enumerate(self.train_qids) if qid in inhouse_qids])
+            self.inhouse_test_indexes = torch.tensor([i for i, qid in enumerate(self.train_qids) if qid not in inhouse_qids])
+        else:
+            self.inhouse_train_indexes, self.inhouse_test_indexes = None, None
+
+        num_choice = self.train_encoder_data[0].size(1) // (num_mask_view + 1)
         self.num_choice = num_choice
         print('num_choice', num_choice)
+
+        # the graph feature, e.g., concept_ids, node_type_ids
         *self.train_decoder_data, self.train_adj_data = load_sparse_adj_data_with_multi_view_contextnode(
-            train_adj_path, max_node_num, num_choice, self.num_view, args)
+            train_adj_path, max_node_num, num_choice, num_view, args, inhouse_test_indexes=self.inhouse_test_indexes)
 
         *self.dev_decoder_data, self.dev_adj_data = load_sparse_adj_data_with_multi_view_contextnode(
-            dev_adj_path, max_node_num, num_choice, self.num_view, args)
+            dev_adj_path, max_node_num, num_choice, test_num_view, args)
+
         assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0)
                    for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
         assert all(len(self.dev_qids) == len(self.dev_adj_data[0]) == x.size(0)
@@ -343,17 +369,13 @@ class Multiview_LM_QAGNN_DataLoader(object):
 
         if test_statement_path is not None:
             self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(
-                test_statement_path, model_type, model_name, max_seq_length, args)
+                test_statement_path, model_type, model_name, max_seq_length,
+                num_mask_view=test_num_mask, mask_view_prob=mask_view_prob,
+            )
             *self.test_decoder_data, self.test_adj_data = load_sparse_adj_data_with_multi_view_contextnode(
-                test_adj_path, max_node_num, num_choice, self.num_view, args)
+                test_adj_path, max_node_num, num_choice, test_num_view, args)
             assert all(len(self.test_qids) == len(self.test_adj_data[0]) == x.size(0)
                        for x in [self.test_labels] + self.test_encoder_data + self.test_decoder_data)
-
-        if self.is_inhouse:
-            with open(inhouse_train_qids_path, 'r') as fin:
-                inhouse_qids = set(line.strip() for line in fin)
-            self.inhouse_train_indexes = torch.tensor([i for i, qid in enumerate(self.train_qids) if qid in inhouse_qids])
-            self.inhouse_test_indexes = torch.tensor([i for i, qid in enumerate(self.train_qids) if qid not in inhouse_qids])
 
         assert 0. < subsample <= 1.
         if subsample < 1.:

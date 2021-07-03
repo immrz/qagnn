@@ -116,6 +116,8 @@ def add_multi_view_arguments(parser):
     parser.add_argument('--mask_view_prob', default=0.15, type=float)
     parser.add_argument('-vsnt', '--view_special_node_type', action='store_true',
                         help='use special node type id for views')
+    parser.add_argument('-vot', '--view_only_train', action='store_true',
+                        help='add views only during training')
 
 
 def get_parser():

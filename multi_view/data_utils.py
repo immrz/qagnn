@@ -63,13 +63,15 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
             return obj.to(device)
 
 
-def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, num_choice, num_view, args):
+def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, num_choice, num_view, args,
+                                                     inhouse_test_indexes=None):
     """
     Load the graph data. Reserve positions for the context nodes.
 
     Parameters:
     -----------
     num_view: int. Number of views of the context node.
+    inhouse_test_indexes: torch.LongTensor. IDs of test samples if not None.
     """
     with open(adj_pk_path, 'rb') as fin:
         adj_concept_pairs = pickle.load(fin)
@@ -85,6 +87,9 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
     # the concept vocab size is 799273
     contextnode_start = 799273
 
+    # record original num_view
+    orig_num_view = num_view
+
     adj_lengths_ori = adj_lengths.clone()
     for idx, _data in tqdm(enumerate(adj_concept_pairs), total=n_samples, desc='loading adj matrices'):
         adj, concepts, qm, am, cid2score = (_data['adj'], _data['concepts'], _data['qmask'],
@@ -98,6 +103,11 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
         assert np.all(concepts < contextnode_start)  # cannot exceed concept vocab size
         assert not np.any(qm & am)  # cannot simultaneously be True
         qam = qm | am
+
+        # check whether this instance needs views
+        num_view = orig_num_view
+        if inhouse_test_indexes is not None and (idx // num_choice) in inhouse_test_indexes and args.view_only_train:
+            num_view = 1
 
         # sanity check: should be T,..,T,F,F,..F
         assert qam[0] == True
@@ -286,7 +296,8 @@ def get_gpt_token_num():
     return len(tokenizer)
 
 
-def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, model_name, max_seq_length, args):
+def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, model_name, max_seq_length,
+                                          num_mask_view=0, mask_view_prob=0.15):
     class InputExample(object):
 
         def __init__(self, example_id, question, contexts, endings, label=None):
@@ -494,7 +505,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer}.get(model_type)
     tokenizer = tokenizer_class.from_pretrained(model_name)
 
-    examples = read_examples_and_mask(statement_jsonl_path, args.num_mask_view, args.mask_view_prob, tokenizer)
+    examples = read_examples_and_mask(statement_jsonl_path, num_mask_view, mask_view_prob, tokenizer)
 
     features = convert_examples_to_features(examples, list(range(len(examples[0].endings))), max_seq_length, tokenizer,
                                             cls_token_at_end=bool(model_type in ['xlnet']),  # xlnet has a cls token at the end
@@ -512,7 +523,8 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
     return (example_ids, all_label, *data_tensors)
 
 
-def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length, args):
+def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length,
+                       num_mask_view=0, mask_view_prob=0.15):
     if model_type in ('lstm',):
         raise NotImplementedError
     elif model_type in ('gpt',):
@@ -522,7 +534,8 @@ def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length,
                                                      model_type,
                                                      model_name,
                                                      max_seq_length,
-                                                     args)
+                                                     num_mask_view=num_mask_view,
+                                                     mask_view_prob=mask_view_prob)
 
 
 def load_info(statement_path: str):
