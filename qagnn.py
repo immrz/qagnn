@@ -334,10 +334,11 @@ def train(args):
                 start_time = time.time()
             global_step += 1
 
-        # compute train accuracy
+        # compute train accuracy and loss
         train_logits = torch.cat(train_logits, dim=0)
         train_labels = torch.cat(train_labels, dim=0)
         train_acc = (train_logits.argmax(1) == train_labels).sum().item() / train_labels.size(0)
+        train_loss = loss_func(train_logits, train_labels).item()  # NOTE: assume CE loss is used
 
         # compute dev and test accuracy
         model.eval()
@@ -369,12 +370,12 @@ def train(args):
             test_acc = float(sum(total_acc)) / len(total_acc)
             all_logits = torch.cat(all_logits, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
-            test_loss = loss_func(all_logits, all_labels).item()
+            test_loss = loss_func(all_logits, all_labels).item()  # NOTE: assume CE loss is used
 
         # epoch logging and save accuracy
         print('-' * 125)
-        print('| epoch {:3} | step {:5} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} | dev_loss {:7.4f} | test_loss {:7.4f} |'.format(
-            epoch_id, global_step, train_acc, dev_acc, test_acc, dev_loss, test_loss))
+        print('| epoch {:3} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} | train_loss: {:7.4f} | dev_loss {:7.4f} | test_loss {:7.4f} |'.format(
+            epoch_id, train_acc, dev_acc, test_acc, train_loss, dev_loss, test_loss))
         print('-' * 125)
         with open(log_path, 'a') as fout:
             fout.write('{},{},{},{}\n'.format(global_step, train_acc, dev_acc, test_acc))
@@ -454,7 +455,7 @@ def eval_detail(args):
 
     save_test_preds = args.save_model
     if not save_test_preds:
-        test_acc = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
+        test_acc, _ = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
     else:
         eval_set = dataset.test()
         total_acc = []
