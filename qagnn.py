@@ -39,12 +39,22 @@ print("gpu: %s" % subprocess.check_output('echo $CUDA_VISIBLE_DEVICES', shell=Tr
 def evaluate_accuracy(eval_set, model):
     n_samples, n_correct = 0, 0
     model.eval()
+
+    all_logits, all_labels = [], []
     with torch.no_grad():
         for qids, labels, *input_data in eval_set:
             logits, _ = model(*input_data)
             n_correct += (logits.argmax(1) == labels).sum().item()
             n_samples += labels.size(0)
-    return n_correct / n_samples
+
+            all_logits.append(logits)
+            all_labels.append(labels)
+
+    all_logits = torch.cat(all_logits, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    loss = nn.functional.cross_entropy(all_logits, all_labels, reduction='mean')
+
+    return n_correct / n_samples, loss.item()
 
 
 def main():
@@ -52,7 +62,8 @@ def main():
     args, _ = parser.parse_known_args()
     parser.add_argument('--mode', default='train', choices=['train', 'eval_detail'], help='run training or evaluation')
     parser.add_argument('--save_dir', default='./saved_models/qagnn/', help='model output directory')
-    parser.add_argument('--save_model', dest='save_model', action='store_true', help='whether to save model')
+    parser.add_argument('--save_model', default=False, const=True, type=bool_flag, nargs='?', help='whether to save model')
+    parser.add_argument('--save_test_preds', default=True, const=True, type=bool_flag, nargs='?')
     parser.add_argument('--save_best_model_only', type=bool_flag, default=True, const=True, nargs='?',
                         help='only save best dev acc model instead of each epoch')
     parser.add_argument('--load_model_path', default=None)
@@ -330,13 +341,13 @@ def train(args):
 
         # compute dev and test accuracy
         model.eval()
-        dev_acc = evaluate_accuracy(dataset.dev(), model)
-        save_test_preds = args.save_model
-        if not save_test_preds:
-            test_acc = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
+        dev_acc, dev_loss = evaluate_accuracy(dataset.dev(), model)
+        if not args.save_test_preds:
+            test_acc, test_loss = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
         else:
             eval_set = dataset.test()
             total_acc = []
+            all_logits, all_labels = [], []
             count = 0
             preds_path = os.path.join(args.save_dir, 'test_e{}_preds.csv'.format(epoch_id))
             with open(preds_path, 'w') as f_preds:
@@ -344,6 +355,8 @@ def train(args):
                     for qids, labels, *input_data in eval_set:
                         count += 1
                         logits, _, concept_ids, node_type_ids, edge_index, edge_type = model(*input_data, detail=True)
+                        all_logits.append(logits)
+                        all_labels.append(labels)
                         predictions = logits.argmax(1)  # [bsize, ]
                         preds_ranked = (-logits).argsort(1)  # [bsize, n_choices]
                         for i, (qid, label, pred, _preds_ranked, cids, ntype, edges, etype) in \
@@ -354,12 +367,15 @@ def train(args):
                             f_preds.flush()
                             total_acc.append(acc)
             test_acc = float(sum(total_acc)) / len(total_acc)
+            all_logits = torch.cat(all_logits, dim=0)
+            all_labels = torch.cat(all_labels, dim=0)
+            test_loss = loss_func(all_logits, all_labels).item()
 
         # epoch logging and save accuracy
-        print('-' * 90)
-        print('| epoch {:3} | step {:5} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} |'.format(
-            epoch_id, global_step, train_acc, dev_acc, test_acc))
-        print('-' * 90)
+        print('-' * 125)
+        print('| epoch {:3} | step {:5} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} | dev_loss {:7.4f} | test_loss {:7.4f} |'.format(
+            epoch_id, global_step, train_acc, dev_acc, test_acc, dev_loss, test_loss))
+        print('-' * 125)
         with open(log_path, 'a') as fout:
             fout.write('{},{},{},{}\n'.format(global_step, train_acc, dev_acc, test_acc))
 
