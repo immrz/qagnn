@@ -132,7 +132,12 @@ class QAGNN(nn.Module):
 
         self.pooler = MultiheadAttPoolLayer(n_attention_head, sent_dim, concept_dim)
 
-        self.fc = MLP(concept_dim + sent_dim + concept_dim, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
+        if args.view_agg == 'drop':
+            fc_sent_dim = sent_dim
+        else:
+            fc_sent_dim = sent_dim * self.num_view
+
+        self.fc = MLP(concept_dim + fc_sent_dim + concept_dim, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
 
         self.dropout_e = nn.Dropout(p_emb)
         self.dropout_fc = nn.Dropout(p_fc)
@@ -151,7 +156,7 @@ class QAGNN(nn.Module):
 
     def forward(self, sent_vecs, concept_ids, node_type_ids, node_scores, adj_lengths, adj, emb_data=None, cache_output=False):
         """
-        sent_vecs: (batch_size, dim_sent)
+        sent_vecs: (batch_size, num_view, dim_sent)
         concept_ids: (batch_size, n_node)
         adj: edge_index, edge_type
         adj_lengths: (batch_size,)
@@ -187,10 +192,27 @@ class QAGNN(nn.Module):
 
         Z_vecs = gnn_output[:, 0]  # (batch_size, dim_node)
 
+        if self.args.view_agg == 'drop':
+            # (batch_size, dim_sent)
+            sent_vecs_for_fc = sent_vecs[:, 0]
+        else:
+            # (batch_size, num_view * dim_sent)
+            if num_view == self.num_view:
+                sent_vecs_for_fc = sent_vecs[:, :num_view, :].view(sent_vecs.size(0), -1)
+                sent_vecs_for_fc = sent_vecs_for_fc / num_view
+            else:
+                sent_vecs_for_fc = torch.cat(
+                    (sent_vecs[:, 0],
+                     torch.zeros(sent_vecs.size(0),
+                                 sent_vecs.size(-1) * (self.num_view - 1),
+                                 device=node_scores.device)),
+                    dim=1,
+                )
+
         # 1 means masked out
         mask = torch.arange(node_type_ids.size(1), device=node_type_ids.device) >= adj_lengths.unsqueeze(1)
 
-        mask = mask | (node_type_ids == 3)  # pool over all KG nodes
+        mask = mask | (node_type_ids >= 3)  # pool over all KG nodes
         mask[mask.all(1), 0] = 0  # a temporary solution to avoid zero node
 
         sent_vecs_for_pooler = sent_vecs[:, 0, :]
@@ -201,7 +223,7 @@ class QAGNN(nn.Module):
             self.adj = adj
             self.pool_attn = pool_attn
 
-        concat = self.dropout_fc(torch.cat((graph_vecs, sent_vecs[:, 0, :], Z_vecs), 1))
+        concat = self.dropout_fc(torch.cat((graph_vecs, sent_vecs_for_fc, Z_vecs), 1))
         logits = self.fc(concat)
         return logits, pool_attn
 

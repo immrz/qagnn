@@ -108,7 +108,7 @@ def add_multi_view_arguments(parser):
         if v.startswith('mask'):
             assert len(v) == 5, 'mask view format should be `mask{n}`'
             num_mask_view = int(v[-1])
-        elif v not in ['mean']:  # pre-defined view candidates
+        elif v not in ['mean', 'shuffle']:  # pre-defined view candidates
             raise NotImplementedError
 
     parser.add_argument('--num_view', default=num_view, type=int)
@@ -118,6 +118,7 @@ def add_multi_view_arguments(parser):
                         help='use special node type id for views')
     parser.add_argument('-vot', '--view_only_train', action='store_true',
                         help='add views only during training')
+    parser.add_argument('--view_agg', choices=['drop', 'concat'], default='drop')
 
 
 def get_parser():

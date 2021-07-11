@@ -126,6 +126,9 @@ def train(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available() and args.cuda:
         torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
     config_path = os.path.join(args.save_dir, 'config.json')
     model_path = os.path.join(args.save_dir, 'model.pt')
