@@ -179,7 +179,7 @@ def train(args):
                                                 subsample=args.subsample, use_cache=args.use_cache,
                                                 num_view=args.num_view, num_mask_view=args.num_mask_view,
                                                 mask_view_prob=args.mask_view_prob, view_only_train=args.view_only_train,
-                                                shuffle='shuffle' in args.views)
+                                                view_shuffle='shuffle' in args.views)
 
     ###################################################################################################
     #   Build model                                                                                   #

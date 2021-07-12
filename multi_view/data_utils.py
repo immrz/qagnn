@@ -297,7 +297,7 @@ def get_gpt_token_num():
 
 
 def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, model_name, max_seq_length,
-                                          num_mask_view=0, mask_view_prob=0.15, shuffle=False):
+                                          num_mask_view=0, mask_view_prob=0.15, view_shuffle=False):
     class InputExample(object):
 
         def __init__(self, example_id, question, contexts, endings, label=None):
@@ -322,7 +322,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
             ]
             self.label = label
 
-    def generate_views(s: str, n: int, p: float, tokenizer: RobertaTokenizer, shuffle=False) -> List[List[str]]:
+    def generate_views(s: str, n: int, p: float, tokenizer: RobertaTokenizer, view_shuffle=False) -> List[List[str]]:
         """Mask tokens in s with probability p, for n times.
         """
         tokens = np.array(tokenizer.tokenize(s))
@@ -331,14 +331,14 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         prob[0, :] = 1.0  # this is the original sentence
         views[prob < p] = tokenizer.mask_token
 
-        if shuffle:
+        if view_shuffle:
             shuffled = np.random.permutation(tokens)
             shuffled = shuffled[np.newaxis, ...]
             views = np.concatenate((views, shuffled), axis=0)
 
         return views.tolist()
 
-    def read_examples_and_mask(statement_path, num_mask_view, mask_view_prob, tokenizer, shuffle=False):
+    def read_examples_and_mask(statement_path, num_mask_view, mask_view_prob, tokenizer, view_shuffle=False):
         # read statements
         with open(statement_path, 'r', encoding='utf8') as fi:
             statements = fi.readlines()
@@ -358,9 +358,10 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
             choices = json_dic["question"]["choices"]  # the answer choices
 
             # generate views for the question; here the views are already tokenized
-            views = generate_views(contexts, num_mask_view, mask_view_prob, tokenizer, shuffle=shuffle)  # List[List[str]]
+            views = generate_views(contexts, num_mask_view, mask_view_prob, tokenizer,
+                                   view_shuffle=view_shuffle)  # List[List[str]]
             views = [v.copy() for _ in range(len(choices)) for v in views]  # List[List[str]]
-            num_sent_view = num_mask_view + 1 + (1 if shuffle else 0)
+            num_sent_view = num_mask_view + 1 + (1 if view_shuffle else 0)
 
             # construct endings
             endings = [c["text"] for c in choices for _ in range(num_sent_view)]
@@ -513,7 +514,8 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer}.get(model_type)
     tokenizer = tokenizer_class.from_pretrained(model_name)
 
-    examples = read_examples_and_mask(statement_jsonl_path, num_mask_view, mask_view_prob, tokenizer, shuffle=shuffle)
+    examples = read_examples_and_mask(statement_jsonl_path, num_mask_view, mask_view_prob, tokenizer,
+                                      view_shuffle=view_shuffle)
 
     features = convert_examples_to_features(examples, list(range(len(examples[0].endings))), max_seq_length, tokenizer,
                                             cls_token_at_end=bool(model_type in ['xlnet']),  # xlnet has a cls token at the end
@@ -532,7 +534,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
 
 
 def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length,
-                       num_mask_view=0, mask_view_prob=0.15, shuffle=False):
+                       num_mask_view=0, mask_view_prob=0.15, view_shuffle=False):
     if model_type in ('lstm',):
         raise NotImplementedError
     elif model_type in ('gpt',):
@@ -544,7 +546,7 @@ def load_input_tensors(input_jsonl_path, model_type, model_name, max_seq_length,
                                                      max_seq_length,
                                                      num_mask_view=num_mask_view,
                                                      mask_view_prob=mask_view_prob,
-                                                     shuffle=shuffle)
+                                                     view_shuffle=view_shuffle)
 
 
 def load_info(statement_path: str):

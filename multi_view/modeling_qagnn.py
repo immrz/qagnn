@@ -342,8 +342,8 @@ class Multiview_LM_QAGNN_DataLoader(object):
                  test_statement_path, test_adj_path,
                  batch_size, eval_batch_size, device, model_name, max_node_num=200, max_seq_length=128,
                  is_inhouse=False, inhouse_train_qids_path=None,
-                 subsample=1.0, use_cache=True, num_view=1, num_mask_view=0, shuffle=False,
-                 mask_view_prob=0.15, view_only_train=False):
+                 subsample=1.0, use_cache=True, num_view=1, num_mask_view=0,
+                 mask_view_prob=0.15, view_only_train=False, view_shuffle=False):
         super().__init__()
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
@@ -355,18 +355,19 @@ class Multiview_LM_QAGNN_DataLoader(object):
 
         test_num_view = 1 if view_only_train else num_view
         test_num_mask = 0 if view_only_train else num_mask_view
-        test_shuffle = False if view_only_train else shuffle
-        print(f'For dev and test, #view, #mask and shuffle are {test_num_view}, {test_num_mask}, {test_shuffle}.')
+        test_shuffle = False if view_only_train else view_shuffle
+        print(f'For train, #view, #mask and view_shuffle are {num_view}, {num_mask_view}, {view_shuffle}.')
+        print(f'For dev and test, #view, #mask and view_shuffle are {test_num_view}, {test_num_mask}, {test_shuffle}.')
 
         # the LM features, e.g., token_ids, attention_mask, etc.
         # NOTE: the shape of the tensors is (N, num_choice, num_mask_view+1, seq_len)
         self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(
             train_statement_path, model_type, model_name, max_seq_length,
-            num_mask_view=num_mask_view, mask_view_prob=mask_view_prob, shuffle=shuffle,
+            num_mask_view=num_mask_view, mask_view_prob=mask_view_prob, view_shuffle=view_shuffle,
         )
         self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(
             dev_statement_path, model_type, model_name, max_seq_length,
-            num_mask_view=test_num_mask, mask_view_prob=mask_view_prob, shuffle=test_shuffle,
+            num_mask_view=test_num_mask, mask_view_prob=mask_view_prob, view_shuffle=test_shuffle,
         )
 
         # if use inhouse test set
@@ -378,7 +379,7 @@ class Multiview_LM_QAGNN_DataLoader(object):
         else:
             self.inhouse_train_indexes, self.inhouse_test_indexes = None, None
 
-        num_choice = self.train_encoder_data[0].size(1) // (num_mask_view + 1 + (1 if shuffle else 0))
+        num_choice = self.train_encoder_data[0].size(1) // (num_mask_view + 1 + (1 if view_shuffle else 0))
         self.num_choice = num_choice
         print('num_choice', num_choice)
 
@@ -397,7 +398,7 @@ class Multiview_LM_QAGNN_DataLoader(object):
         if test_statement_path is not None:
             self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(
                 test_statement_path, model_type, model_name, max_seq_length,
-                num_mask_view=test_num_mask, mask_view_prob=mask_view_prob, shuffle=test_shuffle,
+                num_mask_view=test_num_mask, mask_view_prob=mask_view_prob, view_shuffle=test_shuffle,
             )
             *self.test_decoder_data, self.test_adj_data = load_sparse_adj_data_with_multi_view_contextnode(
                 test_adj_path, max_node_num, num_choice, test_num_view, args)
