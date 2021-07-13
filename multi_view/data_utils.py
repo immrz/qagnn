@@ -8,6 +8,7 @@ try:
 except:
     pass
 
+import string
 import json
 from tqdm import tqdm
 from typing import List
@@ -76,6 +77,7 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
     with open(adj_pk_path, 'rb') as fin:
         adj_concept_pairs = pickle.load(fin)
 
+    max_node_num += (num_view - 1)  # NOTE: to reproduce original results
     n_samples = len(adj_concept_pairs)  # len = n_questions * n_choices
     edge_index, edge_type = [], []
     adj_lengths = torch.zeros((n_samples,), dtype=torch.long)
@@ -322,7 +324,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
             ]
             self.label = label
 
-    def generate_views(s: str, n: int, p: float, tokenizer: RobertaTokenizer, view_shuffle=False) -> List[List[str]]:
+    def generate_mask_views(s: str, n: int, p: float, tokenizer: RobertaTokenizer) -> List[List[str]]:
         """Mask tokens in s with probability p, for n times.
         """
         tokens = np.array(tokenizer.tokenize(s))
@@ -330,13 +332,29 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         prob = np.random.uniform(size=views.shape)
         prob[0, :] = 1.0  # this is the original sentence
         views[prob < p] = tokenizer.mask_token
-
-        if view_shuffle:
-            shuffled = np.random.permutation(tokens)
-            shuffled = shuffled[np.newaxis, ...]
-            views = np.concatenate((views, shuffled), axis=0)
-
         return views.tolist()
+
+    def word_shuffle(s: str, t: RobertaTokenizer, k: int = 3) -> List[str]:
+        space = chr(2 ** 8 + 32)  # the character Ġ
+        tokens = t.tokenize(s)
+
+        # whether each token is a start of bpe subword: the first token, the tokens with heading Ġ, and punctuations
+        bpe_start = np.array([
+            i == 0 or token.startswith(space) or token[0] in string.punctuation for i, token in enumerate(tokens)
+        ])
+
+        # subwords that belong the same word group share same word_idx
+        # e.g., word_idx of ['how', 'Ġare', 'Ġy' 'ou'] is [0, 1, 2, 2]
+        word_idx = bpe_start.cumsum()
+        word_idx = word_idx - word_idx.min()
+
+        noise = np.random.uniform(0, k, size=word_idx.shape)
+        noise[0] = -1  # do not shuffle first token
+        scores = word_idx + noise[word_idx]
+        scores += 1e-6 * np.arange(len(word_idx))  # ensure no reordering inside a word
+        permutation = scores.argsort()
+        tokens = [tokens[p] for p in permutation]
+        return tokens
 
     def read_examples_and_mask(statement_path, num_mask_view, mask_view_prob, tokenizer, view_shuffle=False):
         # read statements
@@ -358,8 +376,12 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
             choices = json_dic["question"]["choices"]  # the answer choices
 
             # generate views for the question; here the views are already tokenized
-            views = generate_views(contexts, num_mask_view, mask_view_prob, tokenizer,
-                                   view_shuffle=view_shuffle)  # List[List[str]]
+            views = generate_mask_views(contexts, num_mask_view, mask_view_prob, tokenizer)  # List[List[str]]
+            if view_shuffle:
+                max_shuffle_distance = 3
+                views.append(word_shuffle(contexts, tokenizer, k=max_shuffle_distance))
+            assert all(len(view) == len(views[0]) for view in views)
+
             views = [v.copy() for _ in range(len(choices)) for v in views]  # List[List[str]]
             num_sent_view = num_mask_view + 1 + (1 if view_shuffle else 0)
 

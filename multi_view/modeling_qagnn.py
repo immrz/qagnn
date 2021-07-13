@@ -134,10 +134,12 @@ class QAGNN(nn.Module):
 
         if args.view_agg == 'drop':
             fc_sent_dim = sent_dim
+            fc_zvec_dim = concept_dim
         else:
             fc_sent_dim = sent_dim * self.num_view
+            fc_zvec_dim = concept_dim * self.num_view
 
-        self.fc = MLP(concept_dim + fc_sent_dim + concept_dim, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
+        self.fc = MLP(concept_dim + fc_sent_dim + fc_zvec_dim, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
 
         self.dropout_e = nn.Dropout(p_emb)
         self.dropout_fc = nn.Dropout(p_fc)
@@ -190,24 +192,19 @@ class QAGNN(nn.Module):
         # run message passing
         gnn_output = self.gnn(gnn_input, adj, node_type_ids, node_scores)
 
-        Z_vecs = gnn_output[:, 0]  # (batch_size, dim_node)
-
         if self.args.view_agg == 'drop':
-            # (batch_size, dim_sent)
+            # (batch_size, d)
             sent_vecs_for_fc = sent_vecs[:, 0]
+            Z_vecs = gnn_output[:, 0]
         else:
-            # (batch_size, num_view * dim_sent)
+            # (batch_size, num_view * d)
             if num_view == self.num_view:
-                sent_vecs_for_fc = sent_vecs[:, :num_view, :].view(sent_vecs.size(0), -1)
-                sent_vecs_for_fc = sent_vecs_for_fc / num_view
+                sent_vecs_for_fc = sent_vecs[:, :num_view].view(sent_vecs.size(0), -1)
+                Z_vecs = gnn_output[:, :num_view].view(sent_vecs.size(0), -1)
             else:
-                sent_vecs_for_fc = torch.cat(
-                    (sent_vecs[:, 0],
-                     torch.zeros(sent_vecs.size(0),
-                                 sent_vecs.size(-1) * (self.num_view - 1),
-                                 device=node_scores.device)),
-                    dim=1,
-                )
+                # reuse first embedding
+                sent_vecs_for_fc = torch.cat([sent_vecs[:, 0] for _ in range(self.num_view)], dim=1)
+                Z_vecs = torch.cat([gnn_output[:, 0] for _ in range(self.num_view)], dim=1)
 
         # 1 means masked out
         mask = torch.arange(node_type_ids.size(1), device=node_type_ids.device) >= adj_lengths.unsqueeze(1)
@@ -296,10 +293,12 @@ class Multiview_LM_QAGNN(nn.Module):
         if sent_vecs.size(1) > 1:
             if use_view_emb:
                 # reduce embeddings of the masked views into one
-                sent_vecs = torch.cat([sent_vecs[:, 0:1, :],
-                                       torch.mean(sent_vecs[:, 1:1+self.num_mask_view, :], dim=1, keepdim=True),
-                                       sent_vecs[:, 1+self.num_mask_view:, :]],
-                                      dim=1)
+                to_concat = [sent_vecs[:, 0:1, :]]
+                if self.num_mask_view > 0:
+                    mask_view_mean = torch.mean(sent_vecs[:, 1:1+self.num_mask_view, :], dim=1, keepdim=True)
+                    to_concat.append(mask_view_mean)
+                to_concat.append(sent_vecs[:, 1+self.num_mask_view:, :])
+                sent_vecs = torch.cat(to_concat, dim=1)
             else:
                 # just take the original sentence embedding
                 sent_vecs = sent_vecs[:, 0:1, :]

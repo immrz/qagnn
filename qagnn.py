@@ -378,7 +378,7 @@ def train(args):
 
         # epoch logging and save accuracy
         print('-' * 125)
-        print('| epoch {:3} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} | train_loss: {:7.4f} | dev_loss {:7.4f} | test_loss {:7.4f} |'.format(
+        print('| epoch {:3} | train_acc {:7.4f} | dev_acc {:7.4f} | test_acc {:7.4f} | train_loss {:7.4f} | dev_loss {:7.4f} | test_loss {:7.4f} |'.format(
             epoch_id, train_acc, dev_acc, test_acc, train_loss, dev_loss, test_loss))
         print('-' * 125)
         with open(log_path, 'a') as fout:
