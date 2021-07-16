@@ -10,6 +10,8 @@ from collections import OrderedDict
 
 from utils.conceptnet import merged_relations
 from transformers import RobertaTokenizer, RobertaForMaskedLM
+import argparse
+import os
 
 
 concept2id = None
@@ -69,7 +71,6 @@ class RobertaForMaskedLMwithLoss(RobertaForMaskedLM):
         super().__init__(config)
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, masked_lm_labels=None):
-        #
         assert attention_mask is not None
         outputs = self.roberta(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, position_ids=position_ids, head_mask=head_mask)
         sequence_output = outputs[0]  # hidden_states of final layer (batch_size, sequence_length, hidden_size)
@@ -165,6 +166,7 @@ def generate_adj_data_from_grounded_concepts__use_LM(grounded_path, cpnet_graph_
         (4) amask that specifices whether a node is a answer concept
         (5) cid2score that maps a concept id to its relevance score given the QA context
     to the output path in python pickle format
+        (6) ac_alloc: boolean array indicating which answer choice the `ac` belongs to; shape (n_choice, n_node)
 
     grounded_path: str
     cpnet_graph_path: str
@@ -181,20 +183,34 @@ def generate_adj_data_from_grounded_concepts__use_LM(grounded_path, cpnet_graph_
         load_cpnet(cpnet_graph_path)
 
     qa_data = []
+    ac_alloc = []
+
     statement_path = grounded_path.replace('grounded', 'statement')
     with open(grounded_path, 'r', encoding='utf-8') as fin_ground, open(statement_path, 'r', encoding='utf-8') as fin_state:
         lines_ground = fin_ground.readlines()
         lines_state = fin_state.readlines()
         assert len(lines_ground) % len(lines_state) == 0
         n_choices = len(lines_ground) // len(lines_state)
-        for j, line in enumerate(lines_ground):
-            dic = json.loads(line)
-            q_ids = set(concept2id[c] for c in dic['qc'])
-            a_ids = set(concept2id[c] for c in dic['ac'])
+
+        for j, line in enumerate(lines_state):
+            # for each question
+            QAcontext = json.loads(line)['question']['stem']
+            q_ids, a_ids, choice_ids = set(), set(), []
+
+            for i in range(n_choices):
+                # for each answer choice
+                dic = json.loads(lines_ground[i + j*n_choices])
+
+                QAcontext += " {}".format(dic['ans'])
+                q_ids |= set([concept2id[c] for c in dic['qc']])
+                tmp = set([concept2id[c] for c in dic['ac']])
+                a_ids |= tmp
+
+                choice_ids.append(tmp)
+
             q_ids = q_ids - a_ids
-            statement_obj = json.loads(lines_state[j//n_choices])
-            QAcontext = "{} {}.".format(statement_obj['question']['stem'], dic['ans'])
             qa_data.append((q_ids, a_ids, QAcontext))
+            ac_alloc.append(choice_ids)
 
     with Pool(num_processes) as p:
         res1 = list(tqdm(p.imap(concepts_to_adj_matrices_2hop_all_pair__use_LM__Part1, qa_data), total=len(qa_data)))
@@ -208,9 +224,43 @@ def generate_adj_data_from_grounded_concepts__use_LM(grounded_path, cpnet_graph_
     with Pool(num_processes) as p:
         res3 = list(tqdm(p.imap(concepts_to_adj_matrices_2hop_all_pair__use_LM__Part3, res2), total=len(res2)))
 
+    assert len(res3) == len(ac_alloc)
+    for j, _data in enumerate(res3):
+        choice_ids = ac_alloc[j]  # list of set
+        concepts = _data['concepts']
+        mask = np.zeros((len(choice_ids), concepts.shape[0]), dtype=np.bool)
+        for i in range(len(choice_ids)):
+            ids = np.array(sorted(choice_ids[i]))
+            index = (concepts.reshape(-1, 1) == ids).nonzero()[0]
+            mask[i, index] = True
+        assert np.sum(mask.any(axis=0)) == _data['amask'].sum()
+        _data['ac_alloc'] = mask
+
     # res is a list of responses
     with open(output_path, 'wb') as fout:
         pickle.dump(res3, fout)
 
     print(f'adj data saved to {output_path}')
     print()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_root', type=str, default='./data')
+    parser.add_argument('--grounded_path', type=str, required=True)
+    parser.add_argument('--output_root', type=str, default='./data')
+    parser.add_argument('--output_path', type=str, required=True)
+    parser.add_argument('--cpnet_graph_path', type=str, default='cpnet/conceptnet.en.pruned.graph')
+    parser.add_argument('--cpnet_vocab_path', type=str, default='cpnet/concept.txt')
+    parser.add_argument('-p', '--num_processes', type=int, default=16)
+    args = parser.parse_args()
+
+    if 'AMLT_DATA_DIR' in os.environ:
+        args.data_root = os.environ['AMLT_DATA_DIR']
+        args.output_root = os.environ['AMLT_OUTPUT_DIR']
+
+    generate_adj_data_from_grounded_concepts__use_LM(os.path.join(args.data_root, args.grounded_path),
+                                                     os.path.join(args.data_root, args.cpnet_graph_path),
+                                                     os.path.join(args.data_root, args.cpnet_vocab_path),
+                                                     os.path.join(args.output_root, args.output_path),
+                                                     args.num_processes)
