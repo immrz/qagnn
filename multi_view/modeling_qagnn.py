@@ -348,6 +348,7 @@ class Multiview_LM_QAGNN_DataLoader(object):
         self.eval_batch_size = eval_batch_size
         self.device0, self.device1 = device
         self.is_inhouse = is_inhouse
+        self.subsample = subsample
 
         model_type = MODEL_NAME_TO_CLASS[model_name]
         print('train_statement_path', train_statement_path)
@@ -368,6 +369,16 @@ class Multiview_LM_QAGNN_DataLoader(object):
             dev_statement_path, model_type, model_name, max_seq_length,
             num_mask_view=test_num_mask, mask_view_prob=mask_view_prob, view_shuffle=test_shuffle,
         )
+
+        # save args for loading train_encoder_data
+        self.resample_view = False
+        self.train_statement_path = train_statement_path
+        self.model_type = model_type
+        self.model_name = model_name
+        self.max_seq_length = max_seq_length
+        self.num_mask_view = num_mask_view
+        self.mask_view_prob = mask_view_prob
+        self.view_shuffle = view_shuffle
 
         # if use inhouse test set
         if self.is_inhouse:
@@ -433,6 +444,23 @@ class Multiview_LM_QAGNN_DataLoader(object):
             return len(self.test_qids) if hasattr(self, 'test_qids') else 0
 
     def train(self):
+        """For training, it's important to resample views each epoch to make the model
+        more generalizable.
+        """
+        if self.resample_view:
+            print('Resampling views for training...')
+            self.train_encoder_data = load_input_tensors(self.train_statement_path,
+                                                         self.model_type,
+                                                         self.model_name,
+                                                         self.max_seq_length,
+                                                         num_mask_view=self.num_mask_view,
+                                                         mask_view_prob=self.mask_view_prob,
+                                                         view_shuffle=self.view_shuffle)[2:]
+            if self.subsample < 1. and not self.is_inhouse:
+                # match the length here
+                self.train_encoder_data = [x[:len(self.train_qids)] for x in self.train_encoder_data]
+        self.resample_view = True
+
         if self.is_inhouse:
             n_train = self.inhouse_train_indexes.size(0)
             train_indexes = self.inhouse_train_indexes[torch.randperm(n_train)]
