@@ -136,7 +136,7 @@ def train(args):
     export_config(args, config_path)
     check_path(model_path)
     with open(log_path, 'w') as fout:
-        fout.write('step,train_acc,dev_acc,test_acc\n')
+        fout.write('step,train_acc,dev_acc,test_acc,train_loss,dev_loss,test_loss\n')
 
     ###################################################################################################
     #   Load data                                                                                     #
@@ -382,7 +382,8 @@ def train(args):
             epoch_id, train_acc, dev_acc, test_acc, train_loss, dev_loss, test_loss))
         print('-' * 125)
         with open(log_path, 'a') as fout:
-            fout.write('{},{},{},{}\n'.format(global_step, train_acc, dev_acc, test_acc))
+            fout.write('{},{},{},{},{},{},{}\n'.format(global_step, train_acc, dev_acc, test_acc,
+                                                       train_loss, dev_loss, test_loss))
 
         if dev_acc >= best_dev_acc:
             best_dev_acc = dev_acc
