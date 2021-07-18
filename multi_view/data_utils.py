@@ -173,14 +173,19 @@ def load_sparse_adj_data_with_multi_view_contextnode(adj_pk_path, max_node_num, 
             if not qam[_coord]:
                 continue  # skip non-QA nodes
 
-            # add contextnodes as heading nodes
-            extra_j.extend(range(num_view))
+            if not args.view_no_edge:
+                # add contextnodes as heading nodes
+                extra_j.extend(range(num_view))
 
-            # add current KG concept as tailing node; NOTE: index shifted by num_view
-            extra_k.extend([_coord + num_view] * num_view)
+                # add current KG concept as tailing node; NOTE: index shifted by num_view
+                extra_k.extend([_coord + num_view] * num_view)
 
-            # add edges with new relation types
-            extra_i.extend([0 if qm[_coord] else 1] * num_view)
+                # add edges with new relation types
+                extra_i.extend([0 if qm[_coord] else 1] * num_view)
+            else:
+                extra_j.append(0)
+                extra_k.append(_coord + num_view)
+                extra_i.append(0 if qm[_coord] else 1)
 
             # TODO: add edges among contextnodes
 

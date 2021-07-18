@@ -279,23 +279,29 @@ class MatrixVectorScaledDotProductAttention(nn.Module):
         super().__init__()
         self.temperature = temperature
         self.dropout = nn.Dropout(attn_dropout)
-        self.softmax = nn.Softmax(dim=1)
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, q, k, v, mask=None):
         """
-        q: tensor of shape (n*b, d_k)
-        k: tensor of shape (n*b, l, d_k)
-        v: tensor of shape (n*b, l, d_v)
+        q: tensor of shape (*, m, d_k)
+        k: tensor of shape (*, l, d_k)
+        v: tensor of shape (*, l, d_v)
+        mask: None or tensor of shape (*, m, l) or (*, 1, l)
 
-        returns: tensor of shape (n*b, d_v), tensor of shape(n*b, l)
+        returns: tensor of shape (*, m, d_v), tensor of shape(*, m, l)
         """
-        attn = (q.unsqueeze(1) * k).sum(2)  # (n*b, l)
+        # attn shape (*, m, l)
+        attn = torch.matmul(q, k.transpose(-2, -1))
         attn = attn / self.temperature
         if mask is not None:
             attn = attn.masked_fill(mask, -np.inf)
+
+        # do softmax on the last dimension
         attn = self.softmax(attn)
         attn = self.dropout(attn)
-        output = (attn.unsqueeze(2) * v).sum(1)
+
+        # output shape (*, m, d_v)
+        output = torch.matmul(attn, v)
         return output, attn
 
 
@@ -343,31 +349,40 @@ class MultiheadAttPoolLayer(nn.Module):
 
     def forward(self, q, k, mask=None):
         """
-        q: tensor of shape (b, d_q_original)
+        q: tensor of shape (b, d_q_original) or (b, m, d_q_original)
         k: tensor of shape (b, l, d_k_original)
         mask: tensor of shape (b, l) (optional, default None)
-        returns: tensor of shape (b, n*d_v)
+        returns: tensor of shape (b, n*d_v) or (b, m, n*d_v)
         """
         n_head, d_k, d_v = self.n_head, self.d_k, self.d_v
 
-        bs, _ = q.size()
+        # if only one query, expand the dimension first
+        squeeze_shape = False
+        if len(q.size()) == 2:
+            q = q.unsqueeze(1)
+            squeeze_shape = True
+
+        bs, len_q, _ = q.size()
         bs, len_k, _ = k.size()
 
-        qs = self.w_qs(q).view(bs, n_head, d_k)  # (b, n, dk)
-        ks = self.w_ks(k).view(bs, len_k, n_head, d_k)  # (b, l, n, dk)
-        vs = self.w_vs(k).view(bs, len_k, n_head, d_v)  # (b, l, n, dv)
-
-        qs = qs.permute(1, 0, 2).contiguous().view(n_head * bs, d_k)
-        ks = ks.permute(2, 0, 1, 3).contiguous().view(n_head * bs, len_k, d_k)
-        vs = vs.permute(2, 0, 1, 3).contiguous().view(n_head * bs, len_k, d_v)
+        qs = self.w_qs(q).view(bs, len_q, n_head, d_k).transpose(1, 2)  # (b, n, m, dk)
+        ks = self.w_ks(k).view(bs, len_k, n_head, d_k).transpose(1, 2)  # (b, n, l, dk)
+        vs = self.w_vs(k).view(bs, len_k, n_head, d_v).transpose(1, 2)  # (b, n, l, dv)
 
         if mask is not None:
-            mask = mask.repeat(n_head, 1)
+            # mask shape (b, 1, 1, l)
+            mask = mask[:, None, None, :]
+
+        # shape: (b, n, m, dv), (b, n, m, l)
         output, attn = self.attention(qs, ks, vs, mask=mask)
 
-        output = output.view(n_head, bs, d_v)
-        output = output.permute(1, 0, 2).contiguous().view(bs, n_head * d_v)  # (b, n*dv)
+        # "concatenate" along the heads using .view(); shape (b, m, n*dv)
+        output = output.transpose(1, 2).contiguous().view(bs, -1, n_head*d_v)
         output = self.dropout(output)
+
+        # if need to recover "unsqueezed" dimension
+        if squeeze_shape:
+            output = output.squeeze(1)
         return output, attn
 
 

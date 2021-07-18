@@ -133,13 +133,13 @@ class QAGNN(nn.Module):
         self.pooler = MultiheadAttPoolLayer(n_attention_head, sent_dim, concept_dim)
 
         if args.view_agg == 'drop':
-            fc_sent_dim = sent_dim
-            fc_zvec_dim = concept_dim
+            fc_input_size = 2 * concept_dim + sent_dim
+        elif args.view_as_pooling_query:
+            fc_input_size = (2 * concept_dim + sent_dim) * self.num_view
         else:
-            fc_sent_dim = sent_dim * self.num_view
-            fc_zvec_dim = concept_dim * self.num_view
+            fc_input_size = concept_dim + sent_dim * self.num_view + concept_dim * self.num_view
 
-        self.fc = MLP(concept_dim + fc_sent_dim + fc_zvec_dim, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
+        self.fc = MLP(fc_input_size, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
 
         self.dropout_e = nn.Dropout(p_emb)
         self.dropout_fc = nn.Dropout(p_fc)
@@ -192,28 +192,40 @@ class QAGNN(nn.Module):
         # run message passing
         gnn_output = self.gnn(gnn_input, adj, node_type_ids, node_scores)
 
-        if self.args.view_agg == 'drop':
-            # (batch_size, d)
-            sent_vecs_for_fc = sent_vecs[:, 0]
-            Z_vecs = gnn_output[:, 0]
-        else:
-            # (batch_size, num_view * d)
-            if num_view == self.num_view:
-                sent_vecs_for_fc = sent_vecs[:, :num_view].view(sent_vecs.size(0), -1)
-                Z_vecs = gnn_output[:, :num_view].view(sent_vecs.size(0), -1)
-            else:
-                # reuse first embedding
-                sent_vecs_for_fc = torch.cat([sent_vecs[:, 0] for _ in range(self.num_view)], dim=1)
-                Z_vecs = torch.cat([gnn_output[:, 0] for _ in range(self.num_view)], dim=1)
-
         # 1 means masked out
         mask = torch.arange(node_type_ids.size(1), device=node_type_ids.device) >= adj_lengths.unsqueeze(1)
 
         mask = mask | (node_type_ids >= 3)  # pool over all KG nodes
         mask[mask.all(1), 0] = 0  # a temporary solution to avoid zero node
 
-        sent_vecs_for_pooler = sent_vecs[:, 0, :]
-        graph_vecs, pool_attn = self.pooler(sent_vecs_for_pooler, gnn_output, mask)
+        # prepare inputs to the classifier
+        # if only use original context node
+        if self.args.view_agg == 'drop':
+            # 2 * dim_node + dim_sent
+            sent_vecs_for_fc = sent_vecs[:, 0]
+            Z_vecs = gnn_output[:, 0]
+            graph_vecs, pool_attn = self.pooler(sent_vecs[:, 0], gnn_output, mask)
+
+        # if use both original and view context nodes
+        else:
+            # (2*dim_node+dim_sent)*num_view or (dim_node+dim_sent)*num_view+dim_node
+            if num_view == self.num_view:
+                sent_vecs_for_fc = sent_vecs.view(sent_vecs.size(0), -1)
+                Z_vecs = gnn_output[:, :num_view].view(sent_vecs.size(0), -1)
+
+                if self.args.view_as_pooling_query:
+                    graph_vecs, pool_attn = self.pooler(sent_vecs, gnn_output, mask)
+                    graph_vecs = graph_vecs.view(sent_vecs.size(0), -1)
+                else:
+                    graph_vecs, pool_attn = self.pooler(sent_vecs[:, 0], gnn_output, mask)
+            else:
+                # reuse first embedding
+                sent_vecs_for_fc = sent_vecs[:, 0].repeat(1, self.num_view)
+                Z_vecs = gnn_output[:, 0].repeat(1, self.num_view)
+                graph_vecs, pool_attn = self.pooler(sent_vecs[:, 0], gnn_output, mask)
+
+                if self.args.view_as_pooling_query:
+                    graph_vecs = graph_vecs.repeat(1, self.num_view)
 
         if cache_output:
             self.concept_ids = concept_ids
@@ -348,6 +360,7 @@ class Multiview_LM_QAGNN_DataLoader(object):
         self.eval_batch_size = eval_batch_size
         self.device0, self.device1 = device
         self.is_inhouse = is_inhouse
+        self.subsample = subsample
 
         model_type = MODEL_NAME_TO_CLASS[model_name]
         print('train_statement_path', train_statement_path)
@@ -368,6 +381,16 @@ class Multiview_LM_QAGNN_DataLoader(object):
             dev_statement_path, model_type, model_name, max_seq_length,
             num_mask_view=test_num_mask, mask_view_prob=mask_view_prob, view_shuffle=test_shuffle,
         )
+
+        # save args for loading train_encoder_data
+        self.resample_view = False
+        self.train_statement_path = train_statement_path
+        self.model_type = model_type
+        self.model_name = model_name
+        self.max_seq_length = max_seq_length
+        self.num_mask_view = num_mask_view
+        self.mask_view_prob = mask_view_prob
+        self.view_shuffle = view_shuffle
 
         # if use inhouse test set
         if self.is_inhouse:
@@ -433,6 +456,23 @@ class Multiview_LM_QAGNN_DataLoader(object):
             return len(self.test_qids) if hasattr(self, 'test_qids') else 0
 
     def train(self):
+        """For training, it's important to resample views each epoch to make the model
+        more generalizable.
+        """
+        if self.resample_view:
+            print('Resampling views for training...')
+            self.train_encoder_data = load_input_tensors(self.train_statement_path,
+                                                         self.model_type,
+                                                         self.model_name,
+                                                         self.max_seq_length,
+                                                         num_mask_view=self.num_mask_view,
+                                                         mask_view_prob=self.mask_view_prob,
+                                                         view_shuffle=self.view_shuffle)[2:]
+            if self.subsample < 1. and not self.is_inhouse:
+                # match the length here
+                self.train_encoder_data = [x[:len(self.train_qids)] for x in self.train_encoder_data]
+        self.resample_view = True
+
         if self.is_inhouse:
             n_train = self.inhouse_train_indexes.size(0)
             train_indexes = self.inhouse_train_indexes[torch.randperm(n_train)]
