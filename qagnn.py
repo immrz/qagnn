@@ -246,6 +246,7 @@ def train(args):
             scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps)
     elif args.lr_schedule == 'warmup_linear':
         max_steps = int(args.n_epochs * (dataset.train_size() / args.batch_size))
+        print(f'Max steps for linear scheduler is {max_steps}')
         try:
             scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=max_steps)
         except:
@@ -325,8 +326,8 @@ def train(args):
 
             if args.max_grad_norm > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            scheduler.step()
             optimizer.step()
+            scheduler.step()
 
             # batch logging
             if (global_step + 1) % args.log_interval == 0:
