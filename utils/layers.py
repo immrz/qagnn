@@ -351,7 +351,7 @@ class MultiheadAttPoolLayer(nn.Module):
         """
         q: tensor of shape (b, d_q_original) or (b, m, d_q_original)
         k: tensor of shape (b, l, d_k_original)
-        mask: tensor of shape (b, l) (optional, default None)
+        mask: tensor of shape (b, l) or (b, m, l) (optional, default None)
         returns: tensor of shape (b, n*d_v) or (b, m, n*d_v)
         """
         n_head, d_k, d_v = self.n_head, self.d_k, self.d_v
@@ -370,8 +370,12 @@ class MultiheadAttPoolLayer(nn.Module):
         vs = self.w_vs(k).view(bs, len_k, n_head, d_v).transpose(1, 2)  # (b, n, l, dv)
 
         if mask is not None:
-            # mask shape (b, 1, 1, l)
-            mask = mask[:, None, None, :]
+            if len(mask.size()) == 2:
+                # to shape (b, 1, 1, l)
+                mask = mask[:, None, None, :]
+            else:
+                # to shape (b, 1, m, l)
+                mask = mask[:, None, ...]
 
         # shape: (b, n, m, dv), (b, n, m, l)
         output, attn = self.attention(qs, ks, vs, mask=mask)

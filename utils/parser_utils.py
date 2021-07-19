@@ -126,6 +126,11 @@ def add_multi_view_arguments(parser):
                         help='also use view emb as query for multi-head self-attention pooling')
 
 
+def add_all_ans_choice_arguments(parser):
+    parser.add_argument('--all_ans', action='store_true',
+                        help='consider all answer choices in a subgraph')
+
+
 def get_parser():
     """A helper function that handles the arguments that all models share"""
     parser = argparse.ArgumentParser(add_help=False)
@@ -134,6 +139,7 @@ def get_parser():
     add_optimization_arguments(parser)
     add_additional_arguments(parser)
     add_multi_view_arguments(parser)
+    add_all_ans_choice_arguments(parser)
     return parser
 
 

@@ -1,14 +1,17 @@
 from modeling.modeling_encoder import TextEncoder, MODEL_NAME_TO_CLASS
-from utils.data_utils import *
-from utils.layers import *
+
+from utils.layers import GELU, CustomizedEmbedding, MultiheadAttPoolLayer, MLP
+from all_answer.data_utils import load_input_tensors, MultiGPUSparseAdjDataBatchGenerator, \
+    load_sparse_adj_data_with_contextnode
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import math
 
 
 class QAGNN_Message_Passing(nn.Module):
-    def __init__(self, args, k, n_ntype, n_etype, input_size, hidden_size, output_size,
-                    dropout=0.1):
+    def __init__(self, args, k, n_ntype, n_etype, input_size, hidden_size, output_size, dropout=0.1):
         super().__init__()
         assert input_size == output_size
         self.n_ntype = n_ntype
@@ -126,7 +129,8 @@ class QAGNN(nn.Module):
 
         self.pooler = MultiheadAttPoolLayer(n_attention_head, sent_dim, concept_dim)
 
-        self.fc = MLP(concept_dim + sent_dim + concept_dim, fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
+        self.fc = MLP(concept_dim + sent_dim + concept_dim + concept_dim,
+                      fc_dim, 1, n_fc_layer, p_fc, layer_norm=True)
 
         self.dropout_e = nn.Dropout(p_emb)
         self.dropout_fc = nn.Dropout(p_fc)
@@ -143,7 +147,8 @@ class QAGNN(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, sent_vecs, concept_ids, node_type_ids, node_scores, adj_lengths, adj, emb_data=None, cache_output=False):
+    def forward(self, sent_vecs, concept_ids, node_type_ids, node_scores, adj_lengths, ac_alloc,
+                adj, emb_data=None, cache_output=False):
         """
         sent_vecs: (batch_size, dim_sent)
         concept_ids: (batch_size, n_node)
@@ -152,6 +157,7 @@ class QAGNN(nn.Module):
         node_type_ids: (batch_size, n_node)
             0 == question entity; 1 == answer choice entity; 2 == other node; 3 == context node
         node_scores: (batch_size, n_node, 1)
+        ac_alloc: (batch_size, num_choice, n_node)
 
         returns: (batch_size, 1)
         """
@@ -187,19 +193,28 @@ class QAGNN(nn.Module):
         mask[mask.all(1), 0] = 0  # a temporary solution to avoid zero node
 
         sent_vecs_for_pooler = sent_vecs
-        graph_vecs, pool_attn = self.pooler(sent_vecs_for_pooler, gnn_output, mask)
+        # shape (bs, d)
+        graph_vecs, _ = self.pooler(sent_vecs_for_pooler, gnn_output, mask)
+
+        # pool over answer concepts of each choice
+        num_choice = ac_alloc.size(1)
+        # shape (bs, num_choice, d) and (bs, num_head, num_choice, n_node)
+        choice_vecs, pool_attn = self.pooler(torch.stack([sent_vecs_for_pooler for _ in range(num_choice)], dim=1),
+                                             gnn_output,
+                                             ~ac_alloc)
 
         if cache_output:
             self.concept_ids = concept_ids
             self.adj = adj
             self.pool_attn = pool_attn
 
-        concat = self.dropout_fc(torch.cat((graph_vecs, sent_vecs, Z_vecs), 1))
-        logits = self.fc(concat)
+        feat_vec = torch.cat((graph_vecs, sent_vecs, Z_vecs), 1).unsqueeze(1).repeat(1, num_choice, 1)
+        feat_vec = torch.cat((feat_vec, choice_vecs), dim=2)
+        logits = self.fc(self.dropout_fc(feat_vec))
         return logits, pool_attn
 
 
-class LM_QAGNN(nn.Module):
+class AllAns_LM_QAGNN(nn.Module):
     def __init__(self, args, model_name, k, n_ntype, n_etype,
                  n_concept, concept_dim, concept_in_dim, n_attention_head,
                  fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
@@ -215,34 +230,31 @@ class LM_QAGNN(nn.Module):
 
     def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
         """
-        sent_vecs: (batch_size, num_choice, d_sent)    -> (batch_size * num_choice, d_sent)
+        sent_vecs: (batch_size, d_sent)
         token_type_ids and attention_mask, etc.
 
-        concept_ids: (batch_size, num_choice, n_node)  -> (batch_size * num_choice, n_node)
-        node_type_ids: (batch_size, num_choice, n_node) -> (batch_size * num_choice, n_node)
-        node_scores
+        concept_ids: (batch_size, n_node)
+        node_type_ids: (batch_size, n_node)
+        node_scores: (batch_size, n_node, 1)
 
-        adj_lengths: (batch_size, num_choice)          -> (batch_size * num_choice, )
+        adj_lengths: (batch_size,)
+        ac_alloc: (batch_size, num_choice, n_node)
         adj = (edge_index, edge_type)
-            edge_index: list shaped (batch_size, num_choice)
-                -> list shaped (batch_size * num_choice,); each entry is torch.tensor(2, E(variable))
+            edge_index: list shaped (batch_size,)
                 -> (2, total E)
-            edge_type: list shaped (batch_size, num_choice)
-                -> list shaped (batch_size * num_choice,); each entry is torch.tensor(E(variable), )
+            edge_type: list shaped (batch_size,)
                 -> (total E,)
         returns: (batch_size, num_choice)
         """
-        # bs: mini_batch_size, nc: number of answer choices
-        bs, nc = inputs[0].size(0), inputs[0].size(1)
-
-        # Here, merge the batch dimension and the num_choice dimension
-        edge_index_orig, edge_type_orig = inputs[-2:]
 
         # flatten the torch tensors and lists along the first two dim
-        _inputs = [x.view(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[:-2]] + [sum(x, []) for x in inputs[-2:]]
+        # _inputs = [x.view(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[:-2]] + [sum(x, []) for x in inputs[-2:]]
 
         # here lm_inputs contains all the embeddings needed by the LM
-        *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type = _inputs
+        *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, ac_alloc, edge_index, edge_type = inputs
+
+        # batch size and num choice
+        bs, nc = ac_alloc.size(0), ac_alloc.size(1)
 
         # edge_index: [2, total_E]   edge_type: [total_E, ]
         edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
@@ -252,15 +264,13 @@ class LM_QAGNN(nn.Module):
         sent_vecs, all_hidden_states = self.encoder(*lm_inputs, layer_id=layer_id)
         logits, attn = self.decoder(sent_vecs.to(node_type_ids.device),
                                     concept_ids,
-                                    node_type_ids, node_scores, adj_lengths, adj,
+                                    node_type_ids, node_scores, adj_lengths, ac_alloc, adj,
                                     emb_data=None, cache_output=cache_output)
         logits = logits.view(bs, nc)
         if not detail:
             return logits, attn
         else:
-            return logits, attn, concept_ids.view(bs, nc, -1), node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
-            # edge_index_orig: list of (batch_size, num_choice). each entry is torch.tensor(2, E)
-            # edge_type_orig: list of (batch_size, num_choice). each entry is torch.tensor(E, )
+            return logits, attn, concept_ids, node_type_ids, edge_index, edge_type
 
     def batch_graph(self, edge_index_init, edge_type_init, n_nodes):
         # edge_index_init: list shaped (n_examples,). each entry is torch.tensor(2, E)
@@ -272,7 +282,7 @@ class LM_QAGNN(nn.Module):
         return edge_index, edge_type
 
 
-class LM_QAGNN_DataLoader(object):
+class AllAns_LM_QAGNN_DataLoader(object):
 
     def __init__(self, args, train_statement_path, train_adj_path,
                  dev_statement_path, dev_adj_path,
@@ -287,32 +297,32 @@ class LM_QAGNN_DataLoader(object):
         self.is_inhouse = is_inhouse
 
         model_type = MODEL_NAME_TO_CLASS[model_name]
+
+        print('Using all answer choices in one subgraph...')
         print('train_statement_path', train_statement_path)
 
         # the LM features, e.g., token_ids, attention_mask, etc.
-        self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(
+        self.num_choice, self.train_qids, self.train_labels, *self.train_encoder_data = load_input_tensors(
             train_statement_path, model_type, model_name, max_seq_length)
-        self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(
+        _, self.dev_qids, self.dev_labels, *self.dev_encoder_data = load_input_tensors(
             dev_statement_path, model_type, model_name, max_seq_length)
 
-        num_choice = self.train_encoder_data[0].size(1)
-        self.num_choice = num_choice
-        print('num_choice', num_choice)
+        print('num_choice', self.num_choice)
         *self.train_decoder_data, self.train_adj_data = load_sparse_adj_data_with_contextnode(
-            train_adj_path, max_node_num, num_choice, args)
+            train_adj_path, max_node_num, self.num_choice, args)
 
         *self.dev_decoder_data, self.dev_adj_data = load_sparse_adj_data_with_contextnode(
-            dev_adj_path, max_node_num, num_choice, args)
+            dev_adj_path, max_node_num, self.num_choice, args)
         assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0)
                    for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
         assert all(len(self.dev_qids) == len(self.dev_adj_data[0]) == x.size(0)
                    for x in [self.dev_labels] + self.dev_encoder_data + self.dev_decoder_data)
 
         if test_statement_path is not None:
-            self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(
+            _, self.test_qids, self.test_labels, *self.test_encoder_data = load_input_tensors(
                 test_statement_path, model_type, model_name, max_seq_length)
             *self.test_decoder_data, self.test_adj_data = load_sparse_adj_data_with_contextnode(
-                test_adj_path, max_node_num, num_choice, args)
+                test_adj_path, max_node_num, self.num_choice, args)
             assert all(len(self.test_qids) == len(self.test_adj_data[0]) == x.size(0)
                        for x in [self.test_labels] + self.test_encoder_data + self.test_decoder_data)
 
@@ -333,7 +343,7 @@ class LM_QAGNN_DataLoader(object):
                 self.train_labels = self.train_labels[:n_train]
                 self.train_encoder_data = [x[:n_train] for x in self.train_encoder_data]
                 self.train_decoder_data = [x[:n_train] for x in self.train_decoder_data]
-                self.train_adj_data = self.train_adj_data[:n_train]
+                self.train_adj_data = (self.train_adj_data[0][:n_train], self.train_adj_data[1][:n_train])
                 assert all(len(self.train_qids) == len(self.train_adj_data[0]) == x.size(0)
                            for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
             assert self.train_size() == n_train

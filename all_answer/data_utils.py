@@ -63,7 +63,8 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
 
 
 def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice, args):
-    cache_path = adj_pk_path +'.loaded_cache'
+    adj_pk_path = adj_pk_path + '.allans'  # use the allans version
+    cache_path = adj_pk_path + f'.{max_node_num}.loaded_cache'
     use_cache = True
 
     if use_cache and not os.path.exists(cache_path):
@@ -71,12 +72,13 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
 
     if use_cache:
         with open(cache_path, 'rb') as f:
-            adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel = pickle.load(f)
+            adj_lengths_ori, concept_ids, node_type_ids, node_scores, \
+                adj_lengths, edge_index, edge_type, half_n_rel, ac_alloc = pickle.load(f)
     else:
         with open(adj_pk_path, 'rb') as fin:
             adj_concept_pairs = pickle.load(fin)
 
-        n_samples = len(adj_concept_pairs)  # len = n_questions * n_choices
+        n_samples = len(adj_concept_pairs)  # len = n_questions
         edge_index, edge_type = [], []
         adj_lengths = torch.zeros((n_samples,), dtype=torch.long)
         # max_node_num is 200 by default
@@ -84,9 +86,13 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
         node_type_ids = torch.full((n_samples, max_node_num), 2, dtype=torch.long)  # default 2: "other node"
         node_scores = torch.zeros((n_samples, max_node_num, 1), dtype=torch.float)
 
+        # boolean array that indicates which answer choices the answer concept belongs to
+        ac_alloc = torch.zeros(n_samples, num_choice, max_node_num, dtype=torch.bool)
+
         adj_lengths_ori = adj_lengths.clone()
         for idx, _data in tqdm(enumerate(adj_concept_pairs), total=n_samples, desc='loading adj matrices'):
-            adj, concepts, qm, am, cid2score = _data['adj'], _data['concepts'], _data['qmask'], _data['amask'], _data['cid2score']
+            adj, concepts, qm, am, cid2score, alloc = _data['adj'], _data['concepts'], \
+                _data['qmask'], _data['amask'], _data['cid2score'], _data['ac_alloc']
             # adj: (n_nodes*17, n_nodes) where 17 is the number of relation types; sparse matrix in COOrdinate format
             # concepts: np.array(n_nodes,), where entry is concept id
             # NOTE: concepts always start with question entities, then answer entities, then other entities.
@@ -114,6 +120,15 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
             # NOTE: to accomodate contextnode, original concept_ids incremented by 1
             concept_ids[idx, 1:num_concept] = torch.tensor(concepts + 1)
             concept_ids[idx, 0] = 0  # this is the "concept_id" for contextnode
+
+            # Prepare answer concepts allocations
+            assert alloc.shape[0] == num_choice
+            origin_alloc_sum = alloc.sum()
+            alloc = alloc[:, :num_concept - 1]
+            ac_alloc[idx, :, 1:num_concept] = torch.tensor(alloc)
+            # check sum; the answer concepts shouldn't be pruned
+            assert ac_alloc[idx].sum().item() == origin_alloc_sum.item(), \
+                f'{idx}, {ac_alloc[idx].sum().item()}, {origin_alloc_sum.item()}, {alloc.sum().item()}'
 
             # Prepare node scores
             if (cid2score is not None):
@@ -172,7 +187,8 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
             edge_type.append(i)  # each entry is [E, ]
 
         with open(cache_path, 'wb') as f:
-            pickle.dump([adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel], f)
+            pickle.dump([adj_lengths_ori, concept_ids, node_type_ids, node_scores,
+                         adj_lengths, edge_index, edge_type, half_n_rel, ac_alloc], f)
 
     ori_adj_mean = adj_lengths_ori.float().mean().item()
     ori_adj_sigma = np.sqrt(((adj_lengths_ori.float() - ori_adj_mean)**2).mean().item())
@@ -181,18 +197,11 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
           ' qc_num: {:.2f} | ac_num: {:.2f} |'.format((node_type_ids == 0).float().sum(1).mean().item(),
                                                       (node_type_ids == 1).float().sum(1).mean().item()))
 
-    # list of size (n_questions, n_choices), where each entry is tensor[2, E]
-    # this operation corresponds to .view(n_questions, n_choices)
-    edge_index = list(map(list, zip(*(iter(edge_index),) * num_choice)))
-    # list of size (n_questions, n_choices), where each entry is tensor[E, ]
-    edge_type = list(map(list, zip(*(iter(edge_type),) * num_choice)))
-
-    concept_ids, node_type_ids, node_scores, adj_lengths = [x.view(-1, num_choice, *x.size()[1:]) for x in (concept_ids, node_type_ids, node_scores, adj_lengths)]
-    # concept_ids: (n_questions, num_choice, max_node_num)
-    # node_type_ids: (n_questions, num_choice, max_node_num)
-    # node_scores: (n_questions, num_choice, max_node_num)
-    # adj_lengths: (n_questions,　num_choice)
-    return concept_ids, node_type_ids, node_scores, adj_lengths, (edge_index, edge_type)  # , half_n_rel * 2 + 1
+    # concept_ids: (n_questions, max_node_num)
+    # node_type_ids: (n_questions, max_node_num)
+    # node_scores: (n_questions, max_node_num, 1)
+    # adj_lengths: (n_questions,)
+    return concept_ids, node_type_ids, node_scores, adj_lengths, ac_alloc, (edge_index, edge_type)
 
 
 def load_gpt_input_tensors(statement_jsonl_path, max_seq_length):
@@ -287,17 +296,14 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
 
     class InputFeatures(object):
 
-        def __init__(self, example_id, choices_features, label):
+        def __init__(self, example_id, features, label):
             self.example_id = example_id
-            self.choices_features = [
-                {
-                    'input_ids': input_ids,
-                    'input_mask': input_mask,
-                    'segment_ids': segment_ids,
-                    'output_mask': output_mask,
-                }
-                for _, input_ids, input_mask, segment_ids, output_mask in choices_features
-            ]
+            self.features = {
+                'input_ids': features[1],
+                'input_mask': features[2],
+                'segment_ids': features[3],
+                'output_mask': features[4]
+            }
             self.label = label
 
     def read_examples(input_file):
@@ -314,7 +320,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
                 examples.append(
                     InputExample(
                         example_id=json_dic["id"],
-                        contexts=[contexts] * len(json_dic["question"]["choices"]),
+                        contexts=contexts,
                         question="",
                         endings=[ending["text"] for ending in json_dic["question"]["choices"]],
                         label=label
@@ -344,80 +350,81 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
 
         features = []
         for ex_index, example in enumerate(examples):
-            choices_features = []
-            for ending_idx, (context, ending) in enumerate(zip(example.contexts, example.endings)):
-                tokens_a = tokenizer.tokenize(context)
-                tokens_b = tokenizer.tokenize(example.question + " " + ending)
+            context = example.contexts
+            ending = ' '.join(example.endings)
 
-                special_tokens_count = 4 if sep_token_extra else 3
-                _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - special_tokens_count)
+            tokens_a = tokenizer.tokenize(context)
+            tokens_b = tokenizer.tokenize(example.question + " " + ending)
 
-                # The convention in BERT is:
-                # (a) For sequence pairs:
-                #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
-                #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
-                # (b) For single sequences:
-                #  tokens:   [CLS] the dog is hairy . [SEP]
-                #  type_ids:   0   0   0   0  0     0   0
-                #
-                # Where "type_ids" are used to indicate whether this is the first
-                # sequence or the second sequence. The embedding vectors for `type=0` and
-                # `type=1` were learned during pre-training and are added to the wordpiece
-                # embedding vector (and position vector). This is not *strictly* necessary
-                # since the [SEP] token unambiguously separates the sequences, but it makes
-                # it easier for the model to learn the concept of sequences.
-                #
-                # For classification tasks, the first vector (corresponding to [CLS]) is
-                # used as as the "sentence vector". Note that this only makes sense because
-                # the entire model is fine-tuned.
-                tokens = tokens_a + [sep_token]
-                if sep_token_extra:
-                    # roberta uses an extra separator b/w pairs of sentences
-                    tokens += [sep_token]
+            special_tokens_count = 4 if sep_token_extra else 3
+            _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - special_tokens_count)
 
-                segment_ids = [sequence_a_segment_id] * len(tokens)
+            # The convention in BERT is:
+            # (a) For sequence pairs:
+            #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
+            #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
+            # (b) For single sequences:
+            #  tokens:   [CLS] the dog is hairy . [SEP]
+            #  type_ids:   0   0   0   0  0     0   0
+            #
+            # Where "type_ids" are used to indicate whether this is the first
+            # sequence or the second sequence. The embedding vectors for `type=0` and
+            # `type=1` were learned during pre-training and are added to the wordpiece
+            # embedding vector (and position vector). This is not *strictly* necessary
+            # since the [SEP] token unambiguously separates the sequences, but it makes
+            # it easier for the model to learn the concept of sequences.
+            #
+            # For classification tasks, the first vector (corresponding to [CLS]) is
+            # used as as the "sentence vector". Note that this only makes sense because
+            # the entire model is fine-tuned.
+            tokens = tokens_a + [sep_token]
+            if sep_token_extra:
+                # roberta uses an extra separator b/w pairs of sentences
+                tokens += [sep_token]
 
-                if tokens_b:
-                    tokens += tokens_b + [sep_token]
-                    segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
+            segment_ids = [sequence_a_segment_id] * len(tokens)
 
-                if cls_token_at_end:
-                    tokens = tokens + [cls_token]
-                    segment_ids = segment_ids + [cls_token_segment_id]
-                else:
-                    tokens = [cls_token] + tokens
-                    segment_ids = [cls_token_segment_id] + segment_ids
+            if tokens_b:
+                tokens += tokens_b + [sep_token]
+                segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
 
-                input_ids = tokenizer.convert_tokens_to_ids(tokens)
+            if cls_token_at_end:
+                tokens = tokens + [cls_token]
+                segment_ids = segment_ids + [cls_token_segment_id]
+            else:
+                tokens = [cls_token] + tokens
+                segment_ids = [cls_token_segment_id] + segment_ids
 
-                # The mask has 1 for real tokens and 0 for padding tokens. Only real
-                # tokens are attended to.
+            input_ids = tokenizer.convert_tokens_to_ids(tokens)
 
-                input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
-                special_token_id = tokenizer.convert_tokens_to_ids([cls_token, sep_token])
-                output_mask = [1 if id in special_token_id else 0 for id in input_ids]  # 1 for mask
+            # The mask has 1 for real tokens and 0 for padding tokens. Only real
+            # tokens are attended to.
 
-                # Zero-pad up to the sequence length.
-                padding_length = max_seq_length - len(input_ids)
-                if pad_on_left:
-                    input_ids = ([pad_token] * padding_length) + input_ids
-                    input_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + input_mask
-                    output_mask = ([1] * padding_length) + output_mask
+            input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
+            special_token_id = tokenizer.convert_tokens_to_ids([cls_token, sep_token])
+            output_mask = [1 if id in special_token_id else 0 for id in input_ids]  # 1 for mask
 
-                    segment_ids = ([pad_token_segment_id] * padding_length) + segment_ids
-                else:
-                    input_ids = input_ids + ([pad_token] * padding_length)
-                    input_mask = input_mask + ([0 if mask_padding_with_zero else 1] * padding_length)
-                    output_mask = output_mask + ([1] * padding_length)
-                    segment_ids = segment_ids + ([pad_token_segment_id] * padding_length)
+            # Zero-pad up to the sequence length.
+            padding_length = max_seq_length - len(input_ids)
+            if pad_on_left:
+                input_ids = ([pad_token] * padding_length) + input_ids
+                input_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + input_mask
+                output_mask = ([1] * padding_length) + output_mask
 
-                assert len(input_ids) == max_seq_length
-                assert len(output_mask) == max_seq_length
-                assert len(input_mask) == max_seq_length
-                assert len(segment_ids) == max_seq_length
-                choices_features.append((tokens, input_ids, input_mask, segment_ids, output_mask))
+                segment_ids = ([pad_token_segment_id] * padding_length) + segment_ids
+            else:
+                input_ids = input_ids + ([pad_token] * padding_length)
+                input_mask = input_mask + ([0 if mask_padding_with_zero else 1] * padding_length)
+                output_mask = output_mask + ([1] * padding_length)
+                segment_ids = segment_ids + ([pad_token_segment_id] * padding_length)
+
+            assert len(input_ids) == max_seq_length
+            assert len(output_mask) == max_seq_length
+            assert len(input_mask) == max_seq_length
+            assert len(segment_ids) == max_seq_length
+            ex_features = (tokens, input_ids, input_mask, segment_ids, output_mask)
             label = label_map[example.label]
-            features.append(InputFeatures(example_id=example.example_id, choices_features=choices_features, label=label))
+            features.append(InputFeatures(example_id=example.example_id, features=ex_features, label=label))
 
         return features
 
@@ -438,9 +445,10 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
                 tokens_b.pop()
 
     def select_field(features, field):
-        return [[choice[field] for choice in feature.choices_features] for feature in features]
+        return [f.features[field] for f in features]
 
     def convert_features_to_tensors(features):
+        # the shape is (n_samples, max_seq_len)
         all_input_ids = torch.tensor(select_field(features, 'input_ids'), dtype=torch.long)
         all_input_mask = torch.tensor(select_field(features, 'input_mask'), dtype=torch.long)
         all_segment_ids = torch.tensor(select_field(features, 'segment_ids'), dtype=torch.long)
@@ -454,7 +462,9 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer}.get(model_type)
     tokenizer = tokenizer_class.from_pretrained(model_name)
     examples = read_examples(statement_jsonl_path)
-    features = convert_examples_to_features(examples, list(range(len(examples[0].endings))), max_seq_length, tokenizer,
+
+    num_choice = len(examples[0].endings)
+    features = convert_examples_to_features(examples, list(range(num_choice)), max_seq_length, tokenizer,
                                             cls_token_at_end=bool(model_type in ['xlnet']),  # xlnet has a cls token at the end
                                             cls_token=tokenizer.cls_token,
                                             sep_token=tokenizer.sep_token,
@@ -465,7 +475,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
                                             sequence_b_segment_id=0 if model_type in ['roberta', 'albert'] else 1)
     example_ids = [f.example_id for f in features]
     *data_tensors, all_label = convert_features_to_tensors(features)
-    return (example_ids, all_label, *data_tensors)
+    return (num_choice, example_ids, all_label, *data_tensors)
 
 
 
