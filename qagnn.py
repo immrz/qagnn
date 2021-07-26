@@ -7,23 +7,11 @@ try:
 except:
     from transformers import get_constant_schedule, get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 
-from modeling.modeling_qagnn import LM_QAGNN, LM_QAGNN_DataLoader
-from modeling.lm_as_edge_encoder import LM_QAGNN_LAEE
-
-from multi_view.modeling_qagnn import Multiview_LM_QAGNN, Multiview_LM_QAGNN_DataLoader
-
-from all_answer.modeling_qagnn import AllAns_LM_QAGNN, AllAns_LM_QAGNN_DataLoader
-
 from utils.optimization_utils import OPTIMIZER_CLASSES
 from utils.parser_utils import get_parser
-from utils.utils import bool_flag, check_path, export_config, freeze_net, unfreeze_net, pretty_args
+from utils.utils import bool_flag, check_path, export_config, freeze_net, \
+    unfreeze_net, pretty_args, dataset_wrapper, model_wrapper
 from utils.data_utils import load_statement_dict
-
-
-DECODER_DEFAULT_LR = {
-    'csqa': 1e-3,
-    'obqa': 3e-4,
-}
 
 import numpy as np
 import torch
@@ -31,7 +19,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-import socket, os, subprocess, datetime
+import socket
+import os
+import subprocess
+import datetime
+
+
+DECODER_DEFAULT_LR = {
+    'csqa': 1e-3,
+    'obqa': 3e-4,
+}
+
+
 print(socket.gethostname())
 print("pid:", os.getpid())
 print("screen: %s" % subprocess.check_output('echo $STY', shell=True).decode('utf'))
@@ -146,9 +145,6 @@ def train(args):
     cp_emb = [np.load(path) for path in args.ent_emb_paths]
     cp_emb = torch.tensor(np.concatenate(cp_emb, 1), dtype=torch.float)
 
-    concept_num, concept_dim = cp_emb.size(0), cp_emb.size(1)
-    print('| num_concepts: {} |'.format(concept_num))
-
     if torch.cuda.device_count() >= 2 and args.cuda:
         device0 = torch.device("cuda:0")
         device1 = torch.device("cuda:1")
@@ -159,93 +155,14 @@ def train(args):
         device0 = torch.device("cpu")
         device1 = torch.device("cpu")
 
-    if args.views is None and not args.all_ans:
-        dataset = LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
-                                      args.dev_statements, args.dev_adj,
-                                      args.test_statements, args.test_adj,
-                                      batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                      device=(device0, device1),
-                                      model_name=args.encoder,
-                                      max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
-                                      is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                      subsample=args.subsample, use_cache=args.use_cache)
-    elif args.all_ans:
-        dataset = AllAns_LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
-                                             args.dev_statements, args.dev_adj,
-                                             args.test_statements, args.test_adj,
-                                             batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                             device=(device0, device1),
-                                             model_name=args.encoder,
-                                             max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
-                                             is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                             subsample=args.subsample, use_cache=args.use_cache)
-    else:
-        dataset = Multiview_LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
-                                                args.dev_statements, args.dev_adj,
-                                                args.test_statements, args.test_adj,
-                                                batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                                device=(device0, device1),
-                                                model_name=args.encoder,
-                                                max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
-                                                is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                                subsample=args.subsample, use_cache=args.use_cache,
-                                                num_view=args.num_view, num_mask_view=args.num_mask_view,
-                                                mask_view_prob=args.mask_view_prob, view_only_train=args.view_only_train,
-                                                view_shuffle='shuffle' in args.views)
+    dataset = dataset_wrapper(args, (device0, device1))
 
     ###################################################################################################
     #   Build model                                                                                   #
     ###################################################################################################
-    if args.all_ans:  # use all-ans QAGNN
-        model = AllAns_LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
-                                concept_dim=args.gnn_dim,
-                                concept_in_dim=concept_dim,
-                                n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
-                                p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
-                                pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
-                                init_range=args.init_range,
-                                encoder_config={})
-        model.encoder.to(device0)
-        model.decoder.to(device1)
-
-    elif args.views is not None:  # use multi-view QAGNN
-        assert not args.lm_as_edge_encoder
-        model = Multiview_LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
-                                   concept_dim=args.gnn_dim,
-                                   concept_in_dim=concept_dim,
-                                   n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
-                                   p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
-                                   pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
-                                   init_range=args.init_range,
-                                   encoder_config={}, views=args.views)
-        model.encoder.to(device0)
-        model.decoder.to(device1)
-
-    elif args.lm_as_edge_encoder:
-        model = LM_QAGNN_LAEE(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
-                              concept_dim=args.gnn_dim,
-                              concept_in_dim=concept_dim,
-                              n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
-                              p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
-                              pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
-                              init_range=args.init_range,
-                              encoder_config={})
-        model.encoder.to(device0)
-        model.decoder.to(device1)
-        model.edge_encoder.to(device1)
-
-    else:
-        model = LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
-                         concept_dim=args.gnn_dim,
-                         concept_in_dim=concept_dim,
-                         n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
-                         p_emb=args.dropouti, p_gnn=args.dropoutg, p_fc=args.dropoutf,
-                         pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
-                         init_range=args.init_range,
-                         encoder_config={})
-        model.encoder.to(device0)
-        model.decoder.to(device1)
-
+    model = model_wrapper(args, (device0, device1), cp_emb)
+    model.encoder.to(device0)
+    model.decoder.to(device1)
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
