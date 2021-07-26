@@ -9,8 +9,8 @@ except:
 
 from utils.optimization_utils import OPTIMIZER_CLASSES
 from utils.parser_utils import get_parser
-from utils.utils import bool_flag, check_path, export_config, freeze_net, \
-    unfreeze_net, pretty_args, dataset_wrapper, model_wrapper
+from utils.utils import bool_flag, check_path, export_config, freeze_net, unfreeze_net, pretty_args
+from utils.wrapper_utils import dataset_wrapper, model_wrapper
 from utils.data_utils import load_statement_dict
 
 import numpy as np
@@ -161,8 +161,6 @@ def train(args):
     #   Build model                                                                                   #
     ###################################################################################################
     model = model_wrapper(args, (device0, device1), cp_emb)
-    model.encoder.to(device0)
-    model.decoder.to(device1)
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
@@ -389,15 +387,10 @@ def eval_detail(args):
     print('args.dev_adj', args.dev_adj)
     print('args.test_adj', args.test_adj)
 
-    dataset = LM_QAGNN_DataLoader(args, args.train_statements, args.train_adj,
-                                  args.dev_statements, args.dev_adj,
-                                  args.test_statements, args.test_adj,
-                                  batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                  device=(device0, device1),
-                                  model_name=old_args.encoder,
-                                  max_node_num=old_args.max_node_num, max_seq_length=old_args.max_seq_len,
-                                  is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                  subsample=args.subsample, use_cache=args.use_cache)
+    args.encoder = old_args.encoder
+    args.max_node_num = old_args.max_node_num
+    args.max_seq_len = old_args.max_seq_len
+    dataset = dataset_wrapper(args, (device0, device1))
 
     save_test_preds = args.save_model
     if not save_test_preds:

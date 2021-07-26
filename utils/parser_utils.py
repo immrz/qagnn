@@ -120,7 +120,7 @@ def add_multi_view_arguments(parser):
                         help='add views only during training')
     parser.add_argument('--view_agg', choices=['drop', 'concat'], default='drop')
 
-    parser.add_argument('-voe', '--view_no_edge', action='store_true',
+    parser.add_argument('-vne', '--view_no_edge', action='store_true',
                         help='do not append edges to view nodes')
     parser.add_argument('-vapq', '--view_as_pooling_query', action='store_true',
                         help='also use view emb as query for multi-head self-attention pooling')

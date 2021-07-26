@@ -1,9 +1,11 @@
 from modeling.modeling_encoder import TextEncoder, MODEL_NAME_TO_CLASS
-from utils.data_utils import *
-from utils.layers import *
+from utils.data_utils import load_input_tensors, MultiGPUSparseAdjDataBatchGenerator, \
+    load_sparse_adj_data_with_contextnode
+from utils.layers import GELU, CustomizedEmbedding, MultiheadAttPoolLayer, MLP
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import math
 
 
 class QAGNN_Message_Passing(nn.Module):
