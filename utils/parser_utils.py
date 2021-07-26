@@ -131,6 +131,16 @@ def add_all_ans_choice_arguments(parser):
                         help='consider all answer choices in a subgraph')
 
 
+def add_drop_edge_arguments(parser):
+    parser.add_argument('--drop_edge', action='store_true')
+    args, _ = parser.parse_known_args()
+    if not args.drop_edge:
+        return
+
+    parser.add_argument('--drop_edge_prob', type=float, required=True)
+    parser.add_argument('--forward_twice', type=bool_flag, nargs='?', default=True, const=True)
+
+
 def get_parser():
     """A helper function that handles the arguments that all models share"""
     parser = argparse.ArgumentParser(add_help=False)
@@ -140,6 +150,7 @@ def get_parser():
     add_additional_arguments(parser)
     add_multi_view_arguments(parser)
     add_all_ans_choice_arguments(parser)
+    add_drop_edge_arguments(parser)
     return parser
 
 

@@ -1,12 +1,20 @@
 from modeling.modeling_qagnn import LM_QAGNN, LM_QAGNN_DataLoader
 from multi_view.modeling_qagnn import Multiview_LM_QAGNN, Multiview_LM_QAGNN_DataLoader
 from all_answer.modeling_qagnn import AllAns_LM_QAGNN, AllAns_LM_QAGNN_DataLoader
+from dropedge.modeling_qagnn import DropEdge_LM_QAGNN
+
+
+def _check_validity(args):
+    # zero or exactly one option
+    assert sum([args.views is not None, args.all_ans, args.drop_edge]) <= 1, \
+        'do not specify multiple options simultaneously'
 
 
 def dataset_wrapper(args, device):
     """An interface for dataset construction according to the given args.
     """
 
+    _check_validity(args)
     dataset_class = LM_QAGNN_DataLoader
     dataset_args = [args,
                     args.train_statements,
@@ -26,9 +34,6 @@ def dataset_wrapper(args, device):
                       'subsample': args.subsample,
                       'use_cache': args.use_cache}
 
-    # zero or exactly one option
-    assert sum([args.views is not None, args.all_ans]) <= 1
-
     if args.views is not None:
         dataset_class = Multiview_LM_QAGNN_DataLoader
         dataset_kwargs.update({'num_view': args.num_view,
@@ -47,6 +52,7 @@ def model_wrapper(args, device, cp_emb):
     """An interface for model construction according to the given args.
     """
 
+    _check_validity(args)
     device0, device1 = device
     concept_num, concept_dim = cp_emb.size(0), cp_emb.size(1)
     print('| num_concepts: {} |'.format(concept_num))
@@ -70,15 +76,17 @@ def model_wrapper(args, device, cp_emb):
                     'init_range': args.init_range,
                     'encoder_config': {}}
 
-    # zero or exactly one option
-    assert sum([args.views is not None, args.all_ans]) <= 1
-
     if args.views is not None:
         model_class = Multiview_LM_QAGNN
         model_kwargs.update({'views': args.views})
 
     elif args.all_ans:
         model_class = AllAns_LM_QAGNN
+
+    elif args.drop_edge:
+        model_class = DropEdge_LM_QAGNN
+        model_kwargs.update({'drop_edge_prob': args.drop_edge_prob,
+                             'forward_twice': args.forward_twice})
 
     model = model_class(*model_args, **model_kwargs)
     model.encoder.to(device0)

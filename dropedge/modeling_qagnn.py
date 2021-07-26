@@ -1,18 +1,21 @@
 from modeling.modeling_encoder import TextEncoder, MODEL_NAME_TO_CLASS
-from utils.data_utils import *
-from utils.layers import *
+from utils.data_utils import load_input_tensors, MultiGPUSparseAdjDataBatchGenerator, \
+    load_sparse_adj_data_with_contextnode
+from utils.layers import GELU, CustomizedEmbedding, MultiheadAttPoolLayer, MLP
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import math
 
 
 class QAGNN_Message_Passing(nn.Module):
     def __init__(self, args, k, n_ntype, n_etype, input_size, hidden_size, output_size,
-                    dropout=0.1):
+                 dropout=0.1, drop_edge_prob=0.0):
         super().__init__()
         assert input_size == output_size
         self.n_ntype = n_ntype
         self.n_etype = n_etype
+        self.drop_edge_prob = drop_edge_prob
 
         assert input_size == hidden_size
         self.hidden_size = hidden_size
@@ -50,6 +53,33 @@ class QAGNN_Message_Passing(nn.Module):
             _X = F.dropout(_X, self.dropout_rate, training=self.training)
         return _X
 
+    def sample_edge(self, edge_index, edge_type, n_nodes):
+        if self.drop_edge_prob < 1e-3 or not self.training:
+            return edge_index, edge_type
+
+        mask = []
+        batch_idx = edge_index // n_nodes
+
+        assert (batch_idx[0] == batch_idx[1]).all()
+
+        batch_size = batch_idx.max().item() + 1
+        for i in range(batch_size):
+            cur_batch_size = (batch_idx[0] == i).sum()
+
+            assert cur_batch_size > 0
+
+            size_keep = int(cur_batch_size * (1 - self.drop_edge_prob))
+            cur_batch_idx = torch.randperm(cur_batch_size)[:size_keep]
+            cur_batch_mask = torch.zeros(cur_batch_size, dtype=torch.bool)
+            cur_batch_mask[cur_batch_idx] = True
+            mask.append(cur_batch_mask)
+
+        mask = torch.cat(mask, dim=0).to(edge_index.device)
+
+        assert mask.size(0) == edge_index.size(1) == edge_type.size(0)
+
+        return edge_index[:, mask].clone(), edge_type[mask].clone()
+
     def forward(self, H, A, node_type, node_score, cache_output=False):
         """
         H: tensor of shape (batch_size, n_node, d_node)
@@ -80,12 +110,14 @@ class QAGNN_Message_Passing(nn.Module):
 
         X = H
         edge_index, edge_type = A  # edge_index: [2, total_E]   edge_type: [total_E, ] where total_E is for the batched graph
+        drop_edge_index, drop_edge_type = self.sample_edge(edge_index, edge_type, _n_nodes)
+
         _X = X.view(-1, X.size(2)).contiguous()  # [`total_n_nodes`, d_node] where `total_n_nodes` = b_size * n_node
         _node_type = node_type.view(-1).contiguous()  # [`total_n_nodes`, ]
         # [`total_n_nodes`, dim]
         _node_feature_extra = torch.cat([node_type_emb, node_score_emb], dim=2).view(_node_type.size(0), -1).contiguous()
 
-        _X = self.mp_helper(_X, edge_index, edge_type, _node_type, _node_feature_extra)
+        _X = self.mp_helper(_X, drop_edge_index, drop_edge_type, _node_type, _node_feature_extra)
 
         X = _X.view(node_type.size(0), node_type.size(1), -1)  # [batch_size, n_node, dim]
 
@@ -100,7 +132,7 @@ class QAGNN(nn.Module):
                  n_concept, concept_dim, concept_in_dim, n_attention_head,
                  fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                  pretrained_concept_emb=None, freeze_ent_emb=True,
-                 init_range=0.02):
+                 init_range=0.02, drop_edge_prob=0.0):
         """Perform joint reasoning on the QA context embedding and the subgraph.
 
         concept_dim:
@@ -122,7 +154,7 @@ class QAGNN(nn.Module):
 
         self.gnn = QAGNN_Message_Passing(args, k=k, n_ntype=n_ntype, n_etype=n_etype,
                                          input_size=concept_dim, hidden_size=concept_dim,
-                                         output_size=concept_dim, dropout=p_gnn)
+                                         output_size=concept_dim, dropout=p_gnn, drop_edge_prob=drop_edge_prob)
 
         self.pooler = MultiheadAttPoolLayer(n_attention_head, sent_dim, concept_dim)
 
@@ -199,19 +231,23 @@ class QAGNN(nn.Module):
         return logits, pool_attn
 
 
-class LM_QAGNN(nn.Module):
+class DropEdge_LM_QAGNN(nn.Module):
     def __init__(self, args, model_name, k, n_ntype, n_etype,
                  n_concept, concept_dim, concept_in_dim, n_attention_head,
                  fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                  pretrained_concept_emb=None, freeze_ent_emb=True,
-                 init_range=0.0, encoder_config={}):
+                 init_range=0.0, encoder_config={},
+                 drop_edge_prob=0.0, forward_twice=False):
         super().__init__()
+        print(f'Using DropEdge_LM_QAGNN. drop_edge_prob: {drop_edge_prob}. forward_twice: {forward_twice}')
+
+        self.forward_twice = forward_twice
         self.encoder = TextEncoder(model_name, **encoder_config)
         self.decoder = QAGNN(args, k, n_ntype, n_etype, self.encoder.sent_dim,
                              n_concept, concept_dim, concept_in_dim, n_attention_head,
                              fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                              pretrained_concept_emb=pretrained_concept_emb, freeze_ent_emb=freeze_ent_emb,
-                             init_range=init_range)
+                             init_range=init_range, drop_edge_prob=drop_edge_prob)
 
     def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
         """
