@@ -1,7 +1,7 @@
 from modeling.modeling_encoder import TextEncoder, MODEL_NAME_TO_CLASS
 from utils.data_utils import load_input_tensors, MultiGPUSparseAdjDataBatchGenerator, \
     load_sparse_adj_data_with_contextnode
-from utils.layers import GELU, CustomizedEmbedding, MultiheadAttPoolLayer, MLP
+from utils.layers import GELU, CustomizedEmbedding, MultiheadAttPoolLayer, MLP, BiKLDivLoss
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -237,11 +237,16 @@ class DropEdge_LM_QAGNN(nn.Module):
                  fc_dim, n_fc_layer, p_emb, p_gnn, p_fc,
                  pretrained_concept_emb=None, freeze_ent_emb=True,
                  init_range=0.0, encoder_config={},
-                 drop_edge_prob=0.0, forward_twice=False):
+                 drop_edge_prob=0.0, forward_twice=False, lambda_c=0.0):
         super().__init__()
-        print(f'Using DropEdge_LM_QAGNN. drop_edge_prob: {drop_edge_prob}. forward_twice: {forward_twice}')
+        print(f'Using DropEdge_LM_QAGNN. drop_edge_prob: {drop_edge_prob}. '
+              f'forward_twice: {forward_twice}. lambda_c: {lambda_c}')
 
         self.forward_twice = forward_twice
+        self.lambda_c = lambda_c
+        self.ce = nn.CrossEntropyLoss(reduction='mean')
+        self.bikl = BiKLDivLoss()
+
         self.encoder = TextEncoder(model_name, **encoder_config)
         self.decoder = QAGNN(args, k, n_ntype, n_etype, self.encoder.sent_dim,
                              n_concept, concept_dim, concept_in_dim, n_attention_head,
@@ -249,7 +254,23 @@ class DropEdge_LM_QAGNN(nn.Module):
                              pretrained_concept_emb=pretrained_concept_emb, freeze_ent_emb=freeze_ent_emb,
                              init_range=init_range, drop_edge_prob=drop_edge_prob)
 
-    def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False):
+    def repeat_input(self, inputs):
+        if not self.forward_twice or not self.training:
+            return inputs
+        outputs = []
+        *tensors, edge_index, edge_type = inputs
+
+        for t in tensors:
+            outputs.append(torch.cat([t, t], dim=0))
+
+        edge_index_clone = [ei.clone() for ei in edge_index]
+        edge_type_clone = [et.clone() for et in edge_type]
+        outputs.append(edge_index + edge_index_clone)
+        outputs.append(edge_type + edge_type_clone)
+
+        return outputs
+
+    def forward(self, *inputs, layer_id=-1, cache_output=False, detail=False, y=None):
         """
         sent_vecs: (batch_size, num_choice, d_sent)    -> (batch_size * num_choice, d_sent)
         token_type_ids and attention_mask, etc.
@@ -278,7 +299,7 @@ class DropEdge_LM_QAGNN(nn.Module):
         _inputs = [x.view(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[:-2]] + [sum(x, []) for x in inputs[-2:]]
 
         # here lm_inputs contains all the embeddings needed by the LM
-        *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type = _inputs
+        *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type = self.repeat_input(_inputs)
 
         # edge_index: [2, total_E]   edge_type: [total_E, ]
         edge_index, edge_type = self.batch_graph(edge_index, edge_type, concept_ids.size(1))
@@ -290,13 +311,26 @@ class DropEdge_LM_QAGNN(nn.Module):
                                     concept_ids,
                                     node_type_ids, node_scores, adj_lengths, adj,
                                     emb_data=None, cache_output=cache_output)
-        logits = logits.view(bs, nc)
-        if not detail:
-            return logits, attn
+
+        if self.forward_twice and self.training:
+            logits = logits.view(2, bs, nc)
+            loss = None if y is None else (0.5 * self.ce(logits[0], y)
+                                           + 0.5 * self.ce(logits[1], y)
+                                           + self.lambda_c * self.bikl(logits[0], logits[1]))
+            if not detail:
+                return logits[0], (loss, attn)
+            else:
+                return logits[0], (loss, attn), concept_ids.view(2, bs, nc, -1), \
+                    node_type_ids.view(2, bs, nc, -1), edge_index_orig, edge_type_orig
         else:
-            return logits, attn, concept_ids.view(bs, nc, -1), node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
-            # edge_index_orig: list of (batch_size, num_choice). each entry is torch.tensor(2, E)
-            # edge_type_orig: list of (batch_size, num_choice). each entry is torch.tensor(E, )
+            logits = logits.view(bs, nc)
+            loss = None if y is None else self.ce(logits, y)
+
+            if not detail:
+                return logits, (loss, attn)
+            else:
+                return logits, (loss, attn), concept_ids.view(bs, nc, -1), \
+                    node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
 
     def batch_graph(self, edge_index_init, edge_type_init, n_nodes):
         # edge_index_init: list shaped (n_examples,). each entry is torch.tensor(2, E)

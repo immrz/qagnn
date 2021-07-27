@@ -139,6 +139,7 @@ def add_drop_edge_arguments(parser):
 
     parser.add_argument('--drop_edge_prob', type=float, required=True)
     parser.add_argument('--forward_twice', type=bool_flag, nargs='?', default=True, const=True)
+    parser.add_argument('--lambda_c', type=float, default=0.5)
 
 
 def get_parser():

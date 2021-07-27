@@ -86,7 +86,8 @@ def model_wrapper(args, device, cp_emb):
     elif args.drop_edge:
         model_class = DropEdge_LM_QAGNN
         model_kwargs.update({'drop_edge_prob': args.drop_edge_prob,
-                             'forward_twice': args.forward_twice})
+                             'forward_twice': args.forward_twice,
+                             'lambda_c': args.lambda_c})
 
     model = model_class(*model_args, **model_kwargs)
     model.encoder.to(device0)

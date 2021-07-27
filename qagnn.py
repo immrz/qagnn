@@ -234,29 +234,29 @@ def train(args):
             # for each mini batch
             for a in range(0, bs, args.mini_batch_size):
                 b = min(a + args.mini_batch_size, bs)
-                logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
+                logits, (loss, _) = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer, y=labels[a:b])
 
                 # save logits
                 train_logits.append(logits.detach().clone())
 
-                # compute loss
-                if args.loss == 'margin_rank':
-                    num_choice = logits.size(1)
-                    flat_logits = logits.view(-1)
-                    correct_mask = F.one_hot(labels, num_classes=num_choice).view(-1)  # of length batch_size*num_choice
-                    # length: batch_size*(num_choice-1)
-                    correct_logits = flat_logits[correct_mask == 1].contiguous() \
-                                                                   .view(-1, 1) \
-                                                                   .expand(-1, num_choice - 1) \
-                                                                   .contiguous() \
-                                                                   .view(-1)
+                # # compute loss
+                # if args.loss == 'margin_rank':
+                #     num_choice = logits.size(1)
+                #     flat_logits = logits.view(-1)
+                #     correct_mask = F.one_hot(labels, num_classes=num_choice).view(-1)  # of length batch_size*num_choice
+                #     # length: batch_size*(num_choice-1)
+                #     correct_logits = flat_logits[correct_mask == 1].contiguous() \
+                #                                                    .view(-1, 1) \
+                #                                                    .expand(-1, num_choice - 1) \
+                #                                                    .contiguous() \
+                #                                                    .view(-1)
 
-                    wrong_logits = flat_logits[correct_mask == 0]
-                    y = wrong_logits.new_ones((wrong_logits.size(0),))
-                    loss = loss_func(correct_logits, wrong_logits, y)  # margin ranking loss
+                #     wrong_logits = flat_logits[correct_mask == 0]
+                #     y = wrong_logits.new_ones((wrong_logits.size(0),))
+                #     loss = loss_func(correct_logits, wrong_logits, y)  # margin ranking loss
 
-                elif args.loss == 'cross_entropy':
-                    loss = loss_func(logits, labels[a:b])
+                # elif args.loss == 'cross_entropy':
+                #     loss = loss_func(logits, labels[a:b])
 
                 loss = loss * (b - a) / bs
                 loss.backward()  # gradient accumulation

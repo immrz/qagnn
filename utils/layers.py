@@ -22,6 +22,17 @@ class GELU(nn.Module):
         return gelu(x)
 
 
+class BiKLDivLoss(nn.Module):
+    def __init__(self):
+        super(BiKLDivLoss, self).__init__()
+        self.kld = nn.KLDivLoss(reduction='batchmean')
+
+    def forward(self, logits1, logits2):
+        p1 = F.softmax(logits1, dim=1)
+        p2 = F.softmax(logits2, dim=1)
+        return (self.kld(torch.log(p1), p2) + self.kld(torch.log(p2), p1)) / 2
+
+
 class TypedLinear(nn.Linear):
     def __init__(self, in_features, out_features, n_type):
         super().__init__(in_features, n_type * out_features)
