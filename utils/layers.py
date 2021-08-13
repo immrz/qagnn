@@ -28,9 +28,9 @@ class BiKLDivLoss(nn.Module):
         self.kld = nn.KLDivLoss(reduction='batchmean')
 
     def forward(self, logits1, logits2):
-        p1 = F.softmax(logits1, dim=1)
-        p2 = F.softmax(logits2, dim=1)
-        return (self.kld(torch.log(p1), p2) + self.kld(torch.log(p2), p1)) / 2
+        loss1 = self.kld(F.log_softmax(logits1, dim=-1), F.softmax(logits2, dim=-1))
+        loss2 = self.kld(F.log_softmax(logits2, dim=-1), F.softmax(logits1, dim=-1))
+        return (loss1 + loss2) / 2
 
 
 class TypedLinear(nn.Linear):
